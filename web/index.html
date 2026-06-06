@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flock — Reynolds boids (Bevy)</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #1a1a1f;
+      color: #ddd;
+      font-family: system-ui, sans-serif;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+    }
+    /* Bevy/winit appends its canvas to <body>; the flex box centers it. */
+    canvas {
+      outline: none;
+      touch-action: none;
+    }
+    #status {
+      text-align: center;
+      max-width: 36rem;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">Loading the simulation… (a few MB of wasm; the first visit takes a moment)</div>
+  <script type="module">
+    const status = document.getElementById('status');
+    if (!navigator.gpu) {
+      // The GPU compute sim needs WebGPU; there is no WebGL2 fallback
+      // (WebGL2 has no compute shaders).
+      status.innerHTML =
+        'This demo needs <b>WebGPU</b>, which this browser does not expose.<br>' +
+        'Use a current Chrome, Edge, or Firefox, or Safari 26+.';
+    } else {
+      try {
+        const { default: init } = await import('./boids.js');
+        await init();
+        status.remove();
+      } catch (e) {
+        // winit historically unwinds out of run() with a fake exception to
+        // hand control to the browser's event loop; only report real errors.
+        if (`${e}`.includes("Using exceptions for control flow")) {
+          status.remove();
+        } else {
+          status.textContent = `Failed to start: ${e}`;
+          throw e;
+        }
+      }
+    }
+  </script>
+</body>
+</html>

@@ -12,8 +12,17 @@ dynamic = ["bevy/dynamic_linking"]
 
 [dependencies]
 bevy = { version = "0.18.1" }
+# Same major version bevy itself uses; for the raw GPU buffers in src/render.rs.
+bytemuck = { version = "1", features = ["derive"] }
 log = { version = "0.4", features = ["max_level_debug", "release_max_level_warn"] }
 rand = "0.9"
+
+# Browser builds only (`web/build.sh`): rand's entropy source needs an
+# explicit opt-in to the browser-crypto backend on wasm. This is half of the
+# opt-in; the matching `--cfg getrandom_backend="wasm_js"` rustflag lives in
+# `.cargo/config.toml`. Native builds are untouched by this section.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [profile.dev]
 opt-level = 1

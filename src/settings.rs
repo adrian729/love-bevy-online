@@ -72,10 +72,14 @@ impl Param {
 
     pub fn range(self) -> (f32, f32) {
         match self {
-            // With the neighbour-sampling cap the sim cost is linear in n;
-            // 20k measured at ~120 fps (release, M4 Pro). The LÖVE original
-            // capped at 300 for browser performance.
-            Self::Count => (10.0, 20_000.0),
+            // Raised round by round as optimizations landed (M4 Pro,
+            // release): ~100+ fps holds to ~640k (GPU compute sim + the
+            // baked-quad instanced renderer), and the max here is 2x that.
+            // Past it the frame is pinned by two floors that can't shrink
+            // without changing the game: the steer pass's neighbour
+            // sampling and the two-triangles-per-boid draw. The LÖVE
+            // original capped at 300 for browser performance.
+            Self::Count => (10.0, 1_280_000.0),
             Self::Speed => (50.0, 1500.0),
             Self::Separation => (0.0, 8.0),
             Self::Alignment => (0.0, 6.0),
@@ -172,10 +176,14 @@ mod tests {
     }
 
     /// The log scale exists to keep small flocks draggable: half the track
-    /// should cover counts up to a few hundred, not up to half the max.
+    /// should cover counts in the hundreds, far below half the max.
     #[test]
     fn count_log_scale_keeps_low_end_usable() {
+        let (_, max) = Param::Count.range();
         let mid = Param::Count.value_from_t(0.5);
-        assert!((100.0..600.0).contains(&mid), "track midpoint = {mid}");
+        assert!(
+            mid >= 100.0 && mid <= max / 20.0,
+            "track midpoint = {mid} (max {max})"
+        );
     }
 }

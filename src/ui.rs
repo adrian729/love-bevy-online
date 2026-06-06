@@ -11,7 +11,7 @@ use bevy::ui::{FocusPolicy, UiGlobalTransform};
 use bevy::window::PrimaryWindow;
 
 use crate::AppState;
-use crate::boids::{Boid, PointerOverUi, RestartRequested};
+use crate::boids::{Flock, PointerOverUi, RestartRequested};
 use crate::settings::{Param, SimSettings};
 
 type ChildSpawner<'w> = RelatedSpawnerCommands<'w, ChildOf>;
@@ -512,13 +512,15 @@ fn sync_panel_visibility(
 }
 
 fn update_hud(
-    boids: Query<(), With<Boid>>,
+    flock: Res<Flock>,
+    gpu_count: Option<Res<crate::gpu_sim::GpuFlockCount>>,
     diagnostics: Res<DiagnosticsStore>,
     mut score: Query<&mut Text, (With<HudScore>, Without<HudFps>)>,
     mut fps: Query<&mut Text, With<HudFps>>,
 ) {
-    // `len()` is O(1) for archetype-filtered queries, unlike `count()`.
-    let label = format!("Boids: {}", boids.iter().len());
+    // GPU sim mode keeps a CPU-side count mirror; the CPU sim owns `Flock`.
+    let count = gpu_count.map_or(flock.0.len(), |gpu| gpu.0);
+    let label = format!("Boids: {}", count);
     for mut text in &mut score {
         if text.0 != label {
             text.0.clone_from(&label);

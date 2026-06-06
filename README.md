@@ -1,8 +1,11 @@
 # Flock — Reynolds boids in Bevy/Rust
 
-A Bevy port of the **flock** experiment from the LÖVE/Lua `love-online` project.
-Same simulation rules, same tunables, same UI behaviour — rebuilt idiomatically
-on Bevy's ECS to compare the two stacks on the same experiment.
+A Bevy port of the **flock** experiment from the LÖVE/Lua `love-online`
+project. Same simulation rules, same tunables, same UI behaviour — rebuilt
+on Bevy to see how far the same experiment can be pushed in Rust.
+
+Answer so far: **the LÖVE original capped at 300 boids; this port holds
+~100+ fps at 640,000**, with the slider allowing 1.28 million.
 
 ```sh
 cargo run            # dev profile: fast iteration (dynamic linking, opt-level 1)
@@ -22,7 +25,7 @@ cargo run --release  # optimized build
 
 | Setting | Range | Default | |
 |---|---|---|---|
-| Boids | 10 – 20,000 | 50 | log-scale slider; the LÖVE original capped at 300 |
+| Boids | 10 – 1,280,000 | 50 | log-scale slider; the LÖVE original capped at 300 |
 | Speed | 50 – 1500 | 400 | |
 | Separation | 0 – 8 | 1.8 | |
 | Alignment | 0 – 6 | 1.0 | |
@@ -30,41 +33,131 @@ cargo run --release  # optimized build
 
 All apply live, including the boid count (the flock grows/shrinks on the fly).
 
+## Architecture
+
+(Design rationale — what each piece is and why it exists — lives in
+[ARCHITECTURE.md](ARCHITECTURE.md).)
+
+Two simulations share one renderer; both implement exactly the same rules
+(`target_force = k * limit(normalize(dir) * max_speed - vel, 0.3)`, converted
+from the original's per-frame units to px/s² so physics are frame-rate
+independent).
+
+- **GPU compute sim** (default, `src/gpu_sim.rs`) — six WGSL dispatches per
+  frame: clear grid → atomic histogram → prefix scan → scatter into
+  cell-major order → steer + integrate → reverse-copy the render instances.
+  State lives in storage buffers; the CPU only updates a uniform (and
+  uploads spawns) — per-boid data never crosses the bus.
+- **CPU sim** (`cargo run --release -- <count> cpu`, `src/boids.rs`) — the
+  reference implementation: parallel counting sort into SoA arrays, then a
+  branchless, hand-SIMD (NEON `Vec4`) steering kernel on the compute task
+  pool. Kept because it's the behavioural baseline the GPU port is checked
+  against, and it's an instructive artifact on its own (~320k boids at
+  ~125 fps).
+- **Renderer** (`src/render.rs`) — the whole flock is *one* instanced draw
+  call into Bevy's `Transparent2d` phase. The boid shape (red dot + white
+  triangle) is baked once, on the CPU, into a 20x12 coverage texture, and
+  each boid is an alpha-tested quad: two triangles, six shader-generated
+  vertices, `[pos, cos/sin]` per boid in the only vertex buffer. Opaque, no
+  MSAA (matching the LÖVE original), depth-written. Alpha-tested fragments
+  forfeit the tile GPU's hidden-surface removal, so the instance buffer is
+  reversed and z decreases across it: the draw runs front-to-back and
+  early-z culls a dense pile's overdraw instead (~78 → ~140 fps at 640k
+  pinned), while later boids still draw on top like the original. The
+  pre-bake 12-vertex geometry pipeline is kept behind the `geo` flag as the
+  visual reference — the baked quad is pixel-equivalent at game scale.
+  One entity per boid was the original design — it collapsed past ~40k
+  under per-entity engine bookkeeping (transform propagation, visibility,
+  extraction), which is why boids are plain data, not entities.
+
+Neighbour search is a flat counting-sort grid (cell = the 100 px neighbour
+radius), so each boid's 3x3 neighbourhood is three contiguous memory spans.
+Above `MAX_NEIGHBOUR_SAMPLES = 128` candidates, each span contributes a
+proportional contiguous block at a per-boid, per-frame pseudo-random offset
+(circular): steering uses only the *direction* of neighbour aggregates, so
+uniform sampling is statistically transparent — and below the budget the
+scan is exhaustive, covering the original's 10–300 range in ordinary play.
+
 ## Performance
 
-Steering runs in parallel on the compute task pool (`Query::par_iter_mut`
-against a frame-start snapshot + spatial hash). Measured on an M4 Pro,
-release build: **10,000 boids at ~120 fps (vsync-limited)**, **20,000 at
-~85–95 fps**, and **~100–115 fps sustained with all 20,000 held in a ring on
-a pinned attractor** (the worst case — the whole flock parked on the cursor;
-neighbour sampling bounds it, see below). Past ~20k the cost is per-entity
-overhead (transform propagation, extraction, batching), which grows linearly;
-the next big jump would be a GPU-compute sim.
+Measured on an M4 Pro, release, 1280x800, via the headless perf harness
+(below). "Pinned" is the sustained worst case: a permanent attractor at
+screen centre piles the whole flock into a dense ring.
 
-The worst case is bounded by neighbour sampling: each boid examines at most
-512 candidates per frame, stride-sampled across its 3x3 cells. Steering only
-uses the *direction* of the neighbour aggregate, so the sample is
-statistically unbiased; with ≤512 candidates the scan is exhaustive and
-bit-for-bit exact, which covers the original's entire 10–300 range.
+| Boids | spread | pinned ring |
+|---|---|---|
+| 320,000 | ~315 fps | ~180 fps |
+| **640,000** | **~165 fps** | **~135 fps** |
+| 1,280,000 | ~85 fps | ~59 fps |
+| 2,097,152 | ~80 fps | — |
 
-Perf-test mode — pass an initial count and fps prints to stdout once a second:
+Past 640k the frame is pinned by two floors, and the next doubling misses
+~100 fps on its worst case (1.28M pinned: ~59 fps) by more than any tuning
+can recover:
+
+- **Simulation**: 1.28M boids × up to 128 neighbour samples ≈ 164M
+  steering samples per frame. The sample budget *is* the behavioural
+  contract — cutting it changes how the flock moves.
+- **Rendering**: 2 triangles per boid is the floor for a textured boid
+  (≈ 7.7M vertex invocations at 1.28M; the render-only floor is ~127 fps,
+  up from ~93 with the 12-vertex geometry).
+
+That's where the optimize-without-changing-behaviour loop stops.
+
+### Perf harness
 
 ```sh
-cargo run --release -- 10000
+cargo run --release -- <count> [pin] [headless] [cpu] [nosim] [geo]
 ```
+
+Prints fps once a second (vsync off). Flags compose:
+
+- `pin` — fake mouse attractor at screen centre (sustained worst case).
+- `headless` — no window: renders to an offscreen texture, schedule
+  free-runs, and a snapshot lands in `/tmp/boids_headless_{0,1,2}.png`
+  every 5 s. Immune to macOS display-sleep/occlusion throttling, which
+  silently caps presentation (and poisons fps numbers) on a sleeping or
+  covered display.
+- `cpu` — use the CPU reference sim.
+- `nosim` — spawn and render only: isolates the render floor.
+- `geo` — render the original 12-vertex boid geometry instead of the
+  baked-texture quads (the visual reference the bake is compared against).
+
+## Running in the browser
+
+The game also builds for the web — full circle, since the LÖVE original was
+capped at 300 boids *because* it ran in a browser. It requires **WebGPU**
+(current Chrome/Edge/Firefox, Safari 26+): the compute sim has no WebGL2
+fallback, because WebGL2 has no compute shaders. The sim was written against
+baseline WebGPU limits from the start, so it ports verbatim; with no CLI
+args the web build boots the right defaults (GPU sim + quad renderer), and
+the native-only paths (perf flags, CPU sim) are simply unreachable.
+
+```sh
+rustup target add wasm32-unknown-unknown   # one-time
+web/build.sh                               # → dist/ (installs a matching wasm-bindgen-cli if needed)
+python3 -m http.server -d dist 8080        # open http://localhost:8080
+```
+
+Deployment is a static site: the `Dockerfile` builds `dist/` and serves it
+with nginx on port 80 (precompressed; in Coolify, add the repo as an
+application with the Dockerfile build pack). Native builds are unaffected
+by any of this — the wasm bits in `Cargo.toml` / `.cargo/config.toml` are
+target-gated.
 
 ## How the LÖVE code maps to Bevy
 
 | LÖVE original | Bevy port |
 |---|---|
-| `Flock` table with parallel `positions`/`velocities` arrays | One entity per boid: `Boid` + `Velocity` + `Transform` (`src/boids.rs`) |
-| `lib/grid.lua` spatial hash | `HashMap<IVec2, Vec<usize>>` rebuilt per frame, cell = neighbour radius; steering+integration parallelized per boid |
-| `target_force` = `k * limit(normalize(dir)*max_speed - vel, 0.3)` | Same formula, converted from per-frame (60 fps) units to px/s² so it is frame-rate independent |
-| `(pos + screen) % screen` wrap | `rem_euclid` wrap in world space |
-| `love.graphics.circle` + `polygon` per boid | One shared vertex-colored `Mesh2d` (red dot + white heading triangle), instanced by all boids |
-| SUIT immediate-mode sliders/buttons | Native retained `bevy_ui` nodes; sliders are hand-rolled — `Interaction::Pressed` persists while the mouse is held, so a drag is just "map cursor x onto the track" (`src/ui.rs`) |
-| `pointerOverUI` → `ignore_mouse` | `PointerOverUi` resource: true while any UI node reports interaction |
-| `state = 'playing' / 'options'` | `States` enum; sim systems gated on `in_state(Playing)`, popup spawned on `OnEnter(Options)` |
+| `Flock` table with parallel `positions`/`velocities` arrays | `Flock` resource (CPU) / storage buffer (GPU); boids are data, not entities |
+| `lib/grid.lua` spatial hash | Flat counting-sort grid, rebuilt per frame (parallel on CPU, atomics on GPU) |
+| `target_force` = `k * limit(normalize(dir)*max_speed - vel, 0.3)` | Same formula, per-frame units converted to px/s² (frame-rate independent) |
+| `(pos + screen) % screen` wrap | Single conditional wrap per axis (boids move px per frame, never a screen) |
+| `love.graphics.circle` + `polygon` per boid | One instanced draw of alpha-tested quads sampling the baked shape (`geo` flag: shared 12-vertex mesh) |
+| `Flock:setSize` truncating arrays | Same: grow appends random boids, shrink truncates (GPU) / removes uniformly (CPU) |
+| SUIT immediate-mode sliders/buttons | Hand-rolled retained `bevy_ui` sliders (`Interaction::Pressed` persists through a drag) |
+| `pointerOverUI` → `ignore_mouse` | `PointerOverUi` resource |
+| `state = 'playing' / 'options'` | `States` enum; sim gated on `Playing`, popup on `OnEnter(Options)` |
 
 Steering constants kept from the original: `max_force 0.3`, separation radius
 50 px, neighbour radius 100 px, mouse attract `k = 4` / repel `k = -6` inside
@@ -73,10 +166,12 @@ Steering constants kept from the original: `max_force 0.3`, separation radius
 Deliberate differences:
 
 - No multi-game main menu — this port is only the flock experiment.
-- An FPS readout was added under the score, to compare runtimes (the point of
-  the experiment).
+- An FPS readout under the score, to compare runtimes (the point of the
+  experiment).
 - Physics are frame-rate independent (the original integrates per frame).
-- The Boids slider is log-scaled so the 10..10,000 range stays draggable.
+- The Boids slider is log-scaled so the huge range stays draggable.
+- No antialiasing — same as LÖVE's default, and 4x MSAA is pure fill-rate
+  cost once the flock piles up.
 
 ## Cargo profile notes
 
@@ -89,5 +184,5 @@ assertions disabled.
   with `cargo build --release --no-default-features`.
 - Heads-up: `log`'s `release_max_level_warn` feature statically strips
   info-level logging from every crate using the `log` facade in release
-  builds — including Bevy's own `LogDiagnosticsPlugin`. That's why perf-test
-  mode prints fps with `println!`.
+  builds — including Bevy's own `LogDiagnosticsPlugin`. That's why the perf
+  harness prints fps with `println!`.
