@@ -11,8 +11,8 @@ use super::sim::{FlowField, SEED_PERIOD};
 use crate::app::{AppState, VsyncEnabled};
 use crate::experiments::{CurrentExperiment, ExperimentId, experiment_active};
 use crate::ui::{
-    COLOR_NORMAL, COLOR_PANEL, ChildSpawner, HudScore, NavAction, ValueEdit, ValueLabel,
-    cycler_plugin, slider_plugin, spawn_button, spawn_checkbox, spawn_cycler,
+    COLOR_NORMAL, COLOR_PANEL, ChildSpawner, HudScore, NameLabel, NavAction, Tooltip, ValueEdit,
+    ValueLabel, cycler_plugin, slider_plugin, spawn_button, spawn_checkbox, spawn_cycler,
     spawn_options_popup, spawn_slider, value_entry_plugin,
 };
 
@@ -37,6 +37,7 @@ pub fn plugin(app: &mut App) {
                 sync_row_visibility,
                 make_value_labels_editable,
                 cancel_edits_on_screen_change,
+                attach_tooltips,
                 (new_field_clicks, reset_settings, update_score)
                     .run_if(experiment_active(ExperimentId::Flow)),
             ),
@@ -105,6 +106,15 @@ impl FlowToggle {
             Self::Arrowheads => "Arrowheads",
             Self::Background => "Gradient bg",
             Self::Animate => "Particle overlay",
+        }
+    }
+
+    /// Hover help, like `FlowParam::tip`.
+    fn tip(self) -> &'static str {
+        match self {
+            Self::Arrowheads => "Draw a head on each arrow.",
+            Self::Background => "A dimmed colour gradient behind the current view.",
+            Self::Animate => "Ride animated particles on top of this view.",
         }
     }
 }
@@ -425,6 +435,44 @@ fn make_value_labels_editable(
 ) {
     for label in &labels {
         commands.entity(label).insert(Interaction::default());
+    }
+}
+
+/// Attach hover help to every flow control (the shared tooltip layer is
+/// opt-in; flock/fish attach none). Name labels get an `Interaction` to
+/// become hoverable; checkboxes and buttons already have one.
+fn attach_tooltips(
+    mut commands: Commands,
+    param_names: Query<(Entity, &FlowParam), Added<NameLabel>>,
+    cycler_names: Query<(Entity, &FlowCycler), Added<NameLabel>>,
+    toggles: Query<(Entity, &FlowToggle), Added<FlowToggle>>,
+    new_field: Query<Entity, Added<NewFieldButton>>,
+    values: Query<Entity, (With<FlowParam>, Added<ValueLabel>)>,
+) {
+    for (label, param) in &param_names {
+        commands
+            .entity(label)
+            .insert((Tooltip(param.tip()), Interaction::default()));
+    }
+    for (label, cycler) in &cycler_names {
+        commands
+            .entity(label)
+            .insert((Tooltip(cycler.tip()), Interaction::default()));
+    }
+    for (checkbox, toggle) in &toggles {
+        commands.entity(checkbox).insert(Tooltip(toggle.tip()));
+    }
+    for button in &new_field {
+        commands.entity(button).insert(Tooltip(
+            "A fresh random seed; the particles keep flowing. \
+             ([R] re-seeds and respawns them too.)",
+        ));
+    }
+    for label in &values {
+        commands.entity(label).insert(Tooltip(
+            "Click to type an exact value — [Enter] applies, [Esc] \
+             cancels, Cmd/Ctrl+V pastes.",
+        ));
     }
 }
 

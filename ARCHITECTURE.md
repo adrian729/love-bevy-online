@@ -26,9 +26,10 @@ registry. A thin shared shell wraps the experiments:
   slider (`SliderBinding`), checkbox, and option-cycler (`CyclerBinding`,
   the original's `type = 'options'` tunables) widgets — lives in
   `src/ui.rs`; experiments contribute only their own content. The typed
-  value entry on slider value labels (`value_entry_plugin`) is opt-in
-  per experiment — only flow registers it; the flock/fish sliders are
-  exactly as they were.
+  value entry on slider value labels (`value_entry_plugin`) and the
+  hover tooltips (`Tooltip` components over a shared bubble system) are
+  opt-in per experiment — only flow registers/attaches them; the
+  flock/fish sliders are exactly as they were.
 
 The flock experiment itself (`src/experiments/flock/`):
 
@@ -153,9 +154,11 @@ tunable ranges, defaults, palettes, and view semantics are the
 original's; the behavior upgrades are documented as a list in
 `sim.rs`'s module docs. The headline ones: bilinear field sampling
 (direction-*vector* lerp, wrap-safe — the Lua reads the nearest cell, so
-every trajectory kinks at cell edges), RK2 advection, an `Evolve`
+every trajectory kinks at cell edges), RK2 advection with the trace
+step capped at 10 px (a half-cell step is huge on coarse grids and drew
+visibly polygonal lines; reach stays length × scale), an `Evolve`
 tunable (the field drifts through a third noise dimension at a fixed
-30 Hz tick; 0 = static = the original), a smoothly interpolated gradient
+30 Hz tick; 0 = static = the original), a per-pixel GPU gradient
 view, tapered feathered streamline ribbons, frame-rate-independent
 trails (fixed 60 Hz of simulated time; the Lua recorded one sample per
 rendered frame), and continuous seeds (the seed pans the noise offset
@@ -184,12 +187,18 @@ arbitrary ones or kept with a stated physical/measured reason
   Everything random is a tiny xorshift64* seeded from the field seed —
   fields, streamline starts, and particle spawns reproduce exactly in
   tests, no `rand` in the sim path.
-- `render.rs` — two layers, two pipelines, both blending premultiplied
-  alpha (one blend state serves the normal layers, `(rgb·a, a)`, and the
-  additive trail glow, `(rgb·a, 0)`, chosen per vertex). The **static
-  layer** (background gradient + the current view's geometry) is the
-  original's render-once-to-a-canvas: CPU-built 12-byte-vertex triangles
-  re-emitted and re-uploaded only when the field's version bumps. The
+- `render.rs` — three layers, three pipelines, all blending
+  premultiplied alpha (one blend state serves the normal layers,
+  `(rgb·a, a)`, and the additive trail glow, `(rgb·a, 0)`, chosen per
+  vertex). The **gradient layer** (the Gradient view and the dimmed
+  background of the other views) is per-fragment: one window quad whose
+  fragment shader bilinearly samples the field's direction grid
+  (uploaded only on rebuild) and runs the Lua palette formulas per
+  pixel — a vertex-color grid creased along quad diagonals and mosaicked
+  sharp warp fronts. The **static layer** (the stroke views' geometry)
+  is the original's render-once-to-a-canvas: CPU-built 12-byte-vertex
+  triangles re-emitted and re-uploaded only when the field's version
+  bumps. The
   **trail layer** is a GPU vertex-pull pipeline: the CPU uploads each
   particle's raw ring buffer plus a 24-byte meta record (head position,
   ring state, packed palette colour) and the vertex shader expands the
@@ -218,7 +227,10 @@ arbitrary ones or kept with a stated physical/measured reason
   cancels any open edit the moment the screen changes, so an edit
   never outlives flow being front and center — while one is open,
   [Esc] cancels it instead of toggling the popup, and a typed "r"
-  doesn't restart.
+  doesn't restart. Every flow control also carries a hover tooltip
+  (`FlowParam::tip` etc. — the original explained nothing): hold the
+  cursor on a control's name, a checkbox, or a button for ~half a
+  second and a bubble explains what it does.
 
 Perf (M4 Pro, headless): **140,000 particles certified at ~120 fps**
 (50k ≈ 340, 100k ≈ 168, 200k ≈ 88; the slider allows 300k ≈ 55 fps —

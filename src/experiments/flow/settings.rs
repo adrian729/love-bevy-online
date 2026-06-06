@@ -151,6 +151,61 @@ impl FlowParam {
     pub const PARTICLE: [Self; 3] = [Self::ParticleCount, Self::ParticleSpeed, Self::TrailFade];
 }
 
+impl FlowParam {
+    /// Hover help shown by the shared tooltip layer (a flow addition —
+    /// the original had no explanations at all).
+    pub fn tip(self) -> &'static str {
+        match self {
+            Self::Seed => {
+                "Which field you get — same seed, same field. Every whole \
+                 number up to 256,000 is a distinct field. Click the value \
+                 to type or paste an exact seed."
+            }
+            Self::Scale => {
+                "Grid cell size in pixels. Small = fine, busy detail; \
+                 large = broad, smooth currents."
+            }
+            Self::NoiseScale => {
+                "Noise frequency. Low = calm, laminar flow; high = tight, \
+                 chaotic swirls."
+            }
+            Self::Octaves => {
+                "Stacked noise layers. 1 = smooth; each extra layer adds \
+                 finer detail on top."
+            }
+            Self::Roughness => {
+                "How loud the finer layers are. Low = gentle; 1 = every \
+                 layer equally loud."
+            }
+            Self::Warp => {
+                "Bends the noise through itself (domain warping). 0 = off; \
+                 higher = turbulent, marbled flow."
+            }
+            Self::Swirl => {
+                "A constant rotation added to every direction, in degrees; \
+                 ±180° spans the full circle."
+            }
+            Self::Evolve => {
+                "Drifts the field over time. 0 = frozen (the original's \
+                 behaviour); higher = faster morphing."
+            }
+            Self::Detail => "How many streamlines are traced.",
+            Self::Length => {
+                "Maximum streamline length, in steps — lines stop at the \
+                 window edge on their own."
+            }
+            Self::LineWidth => "Stroke width of the streamlines and arrows.",
+            Self::Opacity => "Stroke opacity of the streamlines and arrows.",
+            Self::ParticleCount => "How many particles ride the field.",
+            Self::ParticleSpeed => "Particle speed, in pixels per second.",
+            Self::TrailFade => {
+                "How quickly a trail dims behind its particle — higher = \
+                 shorter comet tails."
+            }
+        }
+    }
+}
+
 impl SliderBinding for FlowParam {
     type Settings = FlowSettings;
 
@@ -328,6 +383,20 @@ pub enum FlowCycler {
     Palette,
 }
 
+impl FlowCycler {
+    /// Hover help, like [`FlowParam::tip`].
+    pub fn tip(self) -> &'static str {
+        match self {
+            Self::Mode => {
+                "How the field is shown: traced streamlines, one arrow per \
+                 cell, a smooth colour gradient, or particles riding it \
+                 with glowing trails."
+            }
+            Self::Palette => "The colour scheme mapping flow direction to colour.",
+        }
+    }
+}
+
 impl CyclerBinding for FlowCycler {
     type Settings = FlowSettings;
 
@@ -404,6 +473,10 @@ pub fn plugin(app: &mut App) {
         if flag("evolve") {
             settings.evolve = 1.0;
         }
+        // The dimmed gradient background behind the current view.
+        if flag("bg") {
+            settings.background = true;
+        }
         // Stress probe: the shortest trails (7 visible points vs 20).
         if flag("fade04") {
             settings.trail_fade = 0.4;
@@ -437,6 +510,21 @@ pub fn plugin(app: &mut App) {
         }
         if let Some(value) = kv("seed") {
             settings.seed = value;
+        }
+        if let Some(value) = kv("fieldscale") {
+            settings.scale = value;
+        }
+        if let Some(value) = kv("noise") {
+            settings.noise_scale = value;
+        }
+        if let Some(value) = kv("octaves") {
+            settings.octaves = value;
+        }
+        if let Some(value) = kv("warp") {
+            settings.warp = value;
+        }
+        if let Some(value) = kv("swirl") {
+            settings.swirl = value;
         }
     }
     app.insert_resource(settings);

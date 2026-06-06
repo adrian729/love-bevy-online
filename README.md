@@ -148,9 +148,10 @@ across versions. Flags compose:
   Extra flags pick the other views (`streamlines`, `arrows`, `gradient`),
   `evolve` animates the field, `worst` sets the field-rebuild worst case
   (scale 4, octaves 6, warp 5, evolve, maxed streamline detail/length),
-  `fade04` the shortest trails; `detail=N`/`length=N`/`seed=N` override
-  single tunables for probe grids. Certified: 140,000 particles at
-  ~120 fps on the M4 Pro.
+  `fade04` the shortest trails, `bg` the dimmed gradient background;
+  `detail=`/`length=`/`seed=`/`fieldscale=`/`noise=`/`octaves=`/`warp=`/
+  `swirl=` override single tunables for probe grids. Certified: 140,000
+  particles at ~120 fps on the M4 Pro.
 - `pin` — fake mouse attractor at screen centre (sustained worst case).
 - `headless` — no window: renders to an offscreen texture, schedule
   free-runs, and a snapshot lands in `/tmp/boids_headless_{0,1,2}.png`
@@ -233,9 +234,11 @@ Deliberate differences:
   kink at every cell edge) and steps with Euler; this port interpolates
   the field bilinearly (direction-vector lerp, so the angle wrap is
   seamless) and advects with RK2 — streamlines and particle paths are
-  smooth curves. New `Evolve` tunable: the field drifts through a third
-  noise dimension over time (0 = static, the original). The gradient view
-  interpolates colours across cells instead of flat rects; streamlines
+  smooth curves (the trace step caps at 10 px so coarse grids draw
+  smooth lines too). New `Evolve` tunable: the field drifts through a
+  third noise dimension over time (0 = static, the original). The
+  gradient view is computed per pixel on the GPU (the original drew
+  flat per-cell rects); streamlines
   are tapered, feathered ribbons instead of uniform hairlines; trails
   record at a fixed 60 Hz of simulated time (the original recorded per
   frame, so its trails shrank as fps rose); and the seed pans the noise
@@ -244,7 +247,8 @@ Deliberate differences:
   field (the slider spans them all; the offset wraps the Perlin
   lattice's 256-unit period, so any seed keeps full float precision),
   and clicking the Seed value label (or any flow value label) types or
-  pastes an exact value — Cmd/Ctrl+C/V — to share a field. Particle
+  pastes an exact value — Cmd/Ctrl+C/V — to share a field. Every flow
+  control shows a hover tooltip explaining what it does. Particle
   trails are expanded on the GPU from each particle's raw ring buffer
   (a vertex-pull shader; the glow's cross profile is computed per
   fragment, halving the vertex work), which is what buys the

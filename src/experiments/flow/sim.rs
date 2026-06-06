@@ -363,6 +363,20 @@ impl FlowField {
 #[derive(Resource, Default)]
 pub struct FlowStreamlines(pub Vec<Vec<Vec2>>);
 
+/// Cap on the streamline trace step. The step is half a cell (twice the
+/// Lua's resolution), but at coarse scales half a cell is huge — 50 px at
+/// scale 100 — and the polyline's straight segments read as hard edges.
+/// Capping keeps the drawn curve finer than the eye picks up, whatever
+/// the grid; scales ≤ 20 are untouched (their half-cell is already ≤ the
+/// cap). Cost stays bounded: lines terminate at the window border, which
+/// limits the steps actually traced regardless of reach.
+const TRACE_STEP_MAX: f32 = 10.0;
+
+/// The trace step for a grid scale: half a cell, capped.
+fn trace_step(scale: f32) -> f32 {
+    (scale * 0.5).min(TRACE_STEP_MAX)
+}
+
 /// Advance one RK2 (midpoint) step of `step` px through the field.
 pub fn rk2_step(field: &FlowField, p: Vec2, step: f32) -> Vec2 {
     let d1 = field.sample_dir(p);
@@ -372,7 +386,7 @@ pub fn rk2_step(field: &FlowField, p: Vec2, step: f32) -> Vec2 {
 
 fn trace_streamline(field: &FlowField, start: Vec2, max_steps: usize, bounds: Vec2, out: &mut Vec<Vec2>) {
     out.clear();
-    let step = field.scale * 0.5;
+    let step = trace_step(field.scale);
     let mut p = start;
     out.push(p);
     for _ in 0..max_steps {
@@ -406,9 +420,10 @@ fn retrace_streamlines(
             )
         })
         .collect();
-    // The Lua steps a full cell `length` times; this port steps half-cells,
-    // so doubling the step count keeps the same pixel reach.
-    let max_steps = length * 2;
+    // The Lua steps a full cell `length` times — a reach of length × scale
+    // pixels. This port traces the same reach in finer steps (half a
+    // cell, capped), so `Length` means the same thing at any scale.
+    let max_steps = ((length as f32 * field.scale) / trace_step(field.scale)).ceil() as usize;
 
     let pool = ComputeTaskPool::get_or_init(Default::default);
     let chunk = detail.div_ceil((pool.thread_num().max(1) * 3).min(detail.max(1)));
@@ -1058,6 +1073,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// At coarse scales the trace step caps (uncapped, a half-cell step
+    /// of 50 px draws visibly polygonal lines), and the pixel reach a
+    /// given Length buys is preserved — length × scale, like the Lua.
+    #[test]
+    fn trace_step_caps_but_reach_is_preserved() {
+        assert_eq!(trace_step(20.0), 10.0); // ≤ 20: half a cell, as shipped
+        assert_eq!(trace_step(8.0), 4.0);
+        assert_eq!(trace_step(100.0), 10.0); // coarse: capped
+
+        // A uniform rightward field on a huge canvas: the traced line
+        // must advance in ≤ 10 px segments but still reach length × scale.
+        let big = Vec2::new(40_000.0, 40_000.0);
+        let mut field = FlowField::default();
+        field.rebuild(&lua_params(), big, 100.0);
+        for dir in &mut field.dirs {
+            *dir = Vec2::X;
+        }
+        let mut lines = FlowStreamlines::default();
+        let length = 5; // 5 cells = 500 px of reach
+        retrace_streamlines(&mut lines, &field, 7.0, 1, length, big);
+        let line = &lines.0[0];
+        for pair in line.windows(2) {
+            assert!(
+                (pair[1] - pair[0]).length() <= TRACE_STEP_MAX + 1e-3,
+                "segment longer than the cap: {} -> {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        let reach = (line.last().unwrap() - line.first().unwrap()).length();
+        assert!(
+            (reach - length as f32 * 100.0).abs() <= TRACE_STEP_MAX,
+            "reach {reach} != length x scale"
+        );
     }
 
     #[test]

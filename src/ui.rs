@@ -29,7 +29,8 @@ pub const COLOR_PANEL: Color = Color::srgba(0.0, 0.0, 0.0, 0.45);
 pub const COLOR_TEXT_DIM: Color = Color::srgba(1.0, 1.0, 1.0, 0.75);
 
 pub fn plugin(app: &mut App) {
-    app.add_systems(Startup, spawn_hud)
+    app.init_resource::<TooltipState>()
+        .add_systems(Startup, spawn_hud)
         .add_systems(OnExit(AppState::Options), despawn_options_popup)
         .add_systems(
             Update,
@@ -43,6 +44,7 @@ pub fn plugin(app: &mut App) {
                 slider_feedback,
                 show_value_edits,
                 value_label_hover,
+                show_tooltips,
                 sync_hud_visibility,
                 update_hud_fps,
             ),
@@ -284,6 +286,8 @@ pub fn spawn_slider<B: SliderBinding>(
                 })
                 .with_children(|labels| {
                     labels.spawn((
+                        NameLabel,
+                        binding,
                         Text::new(binding.label()),
                         TextFont::from_font_size(font_size),
                         TextColor(Color::WHITE),
@@ -640,6 +644,8 @@ pub fn spawn_cycler<B: CyclerBinding>(
         ))
         .with_children(|row| {
             row.spawn((
+                NameLabel,
+                binding,
                 Text::new(binding.label()),
                 TextFont::from_font_size(font_size),
                 TextColor(Color::WHITE),
@@ -731,6 +737,114 @@ fn sync_cycler_labels<B: CyclerBinding>(
     for (binding, mut text) in &mut labels {
         text.0 = binding.option_label(binding.get(&settings)).into();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tooltips — opt-in per experiment, like the typed entry: the shared
+// system is inert unless an experiment attaches [`Tooltip`] components to
+// interactive widgets (flow tags its controls; flock/fish attach none and
+// behave exactly as before). Hover a tagged widget for a moment and one
+// floating bubble appears near the cursor; it hides on unhover or press.
+
+/// Hover help for a UI widget. Attach alongside an `Interaction` (the
+/// hover detection); the shared [`show_tooltips`] system does the rest.
+#[derive(Component)]
+pub struct Tooltip(pub &'static str);
+
+/// A slider's or cycler's name text, tagged with its binding — a passive
+/// hook (nothing queries it by default) so experiments can attach
+/// tooltips or other affordances to the label of a specific tunable.
+#[derive(Component)]
+pub struct NameLabel;
+
+/// Hover time before the bubble appears — long enough not to flicker
+/// while the cursor crosses the panel, short enough to feel responsive.
+const TOOLTIP_DELAY: f32 = 0.45;
+/// The bubble's text wrap width (its position clamp allows for it).
+const TOOLTIP_WIDTH: f32 = 260.0;
+
+/// What is hovered, since when, and the bubble entity once shown.
+#[derive(Resource, Default)]
+struct TooltipState {
+    target: Option<Entity>,
+    since: f32,
+    bubble: Option<Entity>,
+}
+
+/// The floating bubble (a single Text node, spawned on show, despawned on
+/// hide).
+#[derive(Component)]
+struct TooltipBubble;
+
+/// Show the hovered widget's tooltip after [`TOOLTIP_DELAY`], anchored
+/// where the cursor was when it appeared. A widget mid-typed-edit shows
+/// no tooltip (its label is busy displaying the buffer).
+fn show_tooltips(
+    mut commands: Commands,
+    time: Res<Time>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    hoverables: Query<(Entity, &Interaction, &Tooltip), Without<ValueEdit>>,
+    mut state: ResMut<TooltipState>,
+) {
+    let hovered = hoverables
+        .iter()
+        .find(|(_, interaction, _)| **interaction == Interaction::Hovered);
+
+    let Some((entity, _, tooltip)) = hovered else {
+        // Nothing hovered (or it got pressed): drop the bubble.
+        if let Some(bubble) = state.bubble.take() {
+            commands.entity(bubble).despawn();
+        }
+        state.target = None;
+        return;
+    };
+
+    if state.target != Some(entity) {
+        // A new hover starts the delay (and hides any previous bubble).
+        if let Some(bubble) = state.bubble.take() {
+            commands.entity(bubble).despawn();
+        }
+        state.target = Some(entity);
+        state.since = time.elapsed_secs();
+        return;
+    }
+    if state.bubble.is_some() || time.elapsed_secs() - state.since < TOOLTIP_DELAY {
+        return;
+    }
+
+    // Anchor beside the cursor, clamped so the bubble stays on screen.
+    let cursor = window
+        .iter()
+        .next()
+        .and_then(|window| window.cursor_position())
+        .unwrap_or(Vec2::new(8.0, 8.0));
+    let mut pos = cursor + Vec2::new(14.0, 18.0);
+    if let Ok(window) = window.single() {
+        pos.x = pos.x.min(window.width() - TOOLTIP_WIDTH - 16.0).max(4.0);
+        pos.y = pos.y.min(window.height() - 80.0).max(4.0);
+    }
+    state.bubble = Some(
+        commands
+            .spawn((
+                TooltipBubble,
+                Text::new(tooltip.0),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgba(1.0, 1.0, 1.0, 0.92)),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(pos.x),
+                    top: Val::Px(pos.y),
+                    max_width: Val::Px(TOOLTIP_WIDTH),
+                    padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.05, 0.05, 0.07, 0.92)),
+                // Above the options popup (GlobalZIndex 10).
+                GlobalZIndex(20),
+            ))
+            .id(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,6 +1258,50 @@ mod tests {
         assert_eq!(app.world().resource::<TestSettings>().value, 1234.0);
         assert!(app.world().get::<ValueEdit>(label).is_none());
         assert_eq!(app.world().get::<Text>(label).unwrap().0, "1234");
+    }
+
+    /// Tooltips appear only after the hover delay and vanish on unhover.
+    #[test]
+    fn tooltips_show_after_delay_and_hide_on_unhover() {
+        use std::time::Duration;
+
+        let mut app = App::new();
+        app.init_resource::<TooltipState>()
+            .insert_resource(Time::<()>::default())
+            .add_systems(Update, show_tooltips);
+        let widget = app
+            .world_mut()
+            .spawn((Interaction::None, Tooltip("explains the thing")))
+            .id();
+        app.update();
+
+        let bubbles = |app: &mut App| {
+            app.world_mut()
+                .query_filtered::<&Text, With<TooltipBubble>>()
+                .iter(app.world())
+                .map(|text| text.0.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Hovering does not show it instantly...
+        *app.world_mut().get_mut::<Interaction>(widget).unwrap() = Interaction::Hovered;
+        app.update();
+        app.update();
+        assert!(bubbles(&mut app).is_empty(), "tooltip showed instantly");
+
+        // ...only after the delay.
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(TOOLTIP_DELAY + 0.1));
+        app.update();
+        app.update();
+        assert_eq!(bubbles(&mut app), vec!["explains the thing".to_string()]);
+
+        // Unhover removes it.
+        *app.world_mut().get_mut::<Interaction>(widget).unwrap() = Interaction::None;
+        app.update();
+        app.update();
+        assert!(bubbles(&mut app).is_empty(), "tooltip survived unhover");
     }
 
     /// Commits clamp to the binding's range, and non-numeric characters

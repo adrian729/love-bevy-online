@@ -1,14 +1,20 @@
 //! Flow rendering: the static field visualization (the Lua's offscreen
 //! canvas) plus the animated particle trails.
 //!
-//! Two layers, two pipelines, both blending **premultiplied alpha** (src
-//! ONE, dst ONE_MINUS_SRC_ALPHA — a vertex emitting `(rgb·a, a)` blends
-//! normally, one emitting `(rgb·a, 0)` adds pure light):
-//! - **static** — background gradient + the current view (streamline
-//!   ribbons / arrows / gradient fill) as CPU-built 12-byte-vertex
-//!   triangles. Re-emitted and re-uploaded only when the field rebuilds
-//!   (`FlowState::version`), the equivalent of the original's
-//!   render-once-to-canvas.
+//! Three layers, three pipelines, all blending **premultiplied alpha**
+//! (src ONE, dst ONE_MINUS_SRC_ALPHA — a vertex emitting `(rgb·a, a)`
+//! blends normally, one emitting `(rgb·a, 0)` adds pure light):
+//! - **gradient** — the Gradient view and the dimmed background of the
+//!   other views, computed **per fragment**: one window-covering quad
+//!   whose fragment shader bilinearly samples the field's direction grid
+//!   (uploaded only on rebuild) and runs the palette per pixel. A
+//!   vertex-color grid was tried first and reads blocky two ways:
+//!   per-triangle interpolation creases along every quad diagonal, and
+//!   cell-corner color sampling mosaics sharp warp fronts.
+//! - **static** — the current view's stroke geometry (streamline ribbons
+//!   / arrows) as CPU-built 12-byte-vertex triangles. Re-emitted and
+//!   re-uploaded only when the field rebuilds (`FlowState::version`),
+//!   the equivalent of the original's render-once-to-canvas.
 //! - **trails** — GPU **vertex-pull**: the CPU uploads only each
 //!   particle's raw trail ring buffer and a 24-byte meta record; the
 //!   vertex shader expands them into tapered glow ribbons + head dots from
@@ -19,8 +25,9 @@
 //!   flock's GPU sim.
 //!
 //! Geometry lives in the sim's window coordinates; the y-flip to world
-//! coordinates happens at CPU vertex emission (static) or in the trail
-//! shader via the uniform's `origin` (the fish convention).
+//! coordinates happens at CPU vertex emission (static) or in the
+//! gradient/trail shaders via the uniform's `origin` (the fish
+//! convention).
 
 use std::f32::consts::TAU;
 
@@ -105,6 +112,10 @@ pub fn plugin(app: &mut App) {
     let mut shaders = app.world_mut().resource_mut::<Assets<Shader>>();
     let static_layer = shaders.add(Shader::from_wgsl(FLOW_SHADER, file!()));
     let trails = shaders.add(Shader::from_wgsl(FLOW_TRAIL_SHADER, concat!(file!(), "#trails")));
+    let gradient = shaders.add(Shader::from_wgsl(
+        FLOW_GRADIENT_SHADER,
+        concat!(file!(), "#gradient"),
+    ));
 
     app.init_resource::<FlowDrawData>()
         .init_resource::<FlowPaletteLut>()
@@ -125,11 +136,14 @@ pub fn plugin(app: &mut App) {
         .insert_resource(FlowShader {
             static_layer,
             trails,
+            gradient,
         })
         .add_render_command::<Transparent2d, DrawFlow>()
         .add_render_command::<Transparent2d, DrawFlowTrails>()
+        .add_render_command::<Transparent2d, DrawFlowGradientLayer>()
         .init_resource::<SpecializedRenderPipelines<FlowPipeline>>()
         .init_resource::<SpecializedRenderPipelines<FlowTrailPipeline>>()
+        .init_resource::<SpecializedRenderPipelines<FlowGradientPipeline>>()
         .add_systems(
             RenderStartup,
             (
@@ -208,21 +222,29 @@ fn trail_verts_per_particle(max_points: u32) -> u32 {
     (max_points.max(2) - 1) * SEG_VERTS + DOT_VERTS
 }
 
-/// Main-world handoff: the static layer (re-emitted on rebuild) and the
-/// per-particle trail meta records (re-packed every frame; the trail
-/// *samples* go straight from `FlowParticles` to the render world in
-/// extract). `static_version` is the `FlowState::version` the static
-/// geometry was built from — `None` until the first build and after a
-/// clear.
+/// Main-world handoff: the static layer (re-emitted on rebuild), the
+/// gradient layer's switches (the field itself goes straight from
+/// `FlowField` to the render world in extract), and the per-particle
+/// trail meta records (re-packed every frame; the trail *samples* go
+/// straight from `FlowParticles`). `static_version` is the
+/// `FlowState::version` the static geometry was built from — `None`
+/// until the first build and after a clear.
 #[derive(Resource, Default)]
 struct FlowDrawData {
     static_vertices: Vec<FlowVertex>,
     static_indices: Vec<u32>,
     static_version: Option<u64>,
+    /// Whether the per-fragment gradient layer draws (the Gradient view,
+    /// or the dimmed background under the other views), and how dimmed.
+    gradient_on: bool,
+    gradient_brightness: f32,
+    /// Index into `FlowPalette::ALL`, the shader's palette switch.
+    gradient_palette: u32,
     meta: Vec<TrailMeta>,
     fade_k: f32,
     max_points: u32,
     origin: Vec2,
+    bounds: Vec2,
 }
 
 // ---------------------------------------------------------------------------
@@ -397,50 +419,6 @@ impl FlowEmitter {
 
 }
 
-/// The gradient view / dimmed background: a vertex grid over the whole
-/// viewport, one corner per cell boundary, colored by the smooth field
-/// angle there. The GPU interpolates — the original's flat per-cell rects,
-/// smoothed (a deliberate difference).
-fn emit_gradient(
-    emitter: &mut FlowEmitter,
-    field: &FlowField,
-    lut: &FlowPaletteLut,
-    bounds: Vec2,
-    brightness: f32,
-) {
-    let (cols, rows) = (field.cols, field.rows);
-    let cw = bounds.x / cols as f32;
-    let ch = bounds.y / rows as f32;
-    let base = emitter.vertices.len() as u32;
-    for i in 0..=rows {
-        for j in 0..=cols {
-            // Vertices span the viewport exactly (the Lua's cw = vw/cols
-            // stretch); colors sample the field at the matching *grid*
-            // coordinate, so a window that isn't a multiple of `scale`
-            // stretches the field uniformly instead of skewing it.
-            let p = Vec2::new(j as f32 * cw, i as f32 * ch);
-            let grid_p = Vec2::new(j as f32 * field.scale, i as f32 * field.scale);
-            let rgb = lut.linear(field.angle_at(grid_p));
-            let color = premul(
-                [rgb[0] * brightness, rgb[1] * brightness, rgb[2] * brightness],
-                1.0,
-                false,
-            );
-            emitter.vertex(p, color);
-        }
-    }
-    let stride = (cols + 1) as u32;
-    for i in 0..rows as u32 {
-        for j in 0..cols as u32 {
-            let a = base + i * stride + j;
-            let b = a + 1;
-            let c = a + stride;
-            let d = c + 1;
-            emitter.indices.extend_from_slice(&[a, b, c, b, d, c]);
-        }
-    }
-}
-
 /// The arrows view: one feathered stroke of length 3·scale per cell,
 /// rotated to the cell angle, optional arrowheads (lib/flow.lua's
 /// `draw_lines`).
@@ -516,27 +494,32 @@ fn emit_static(
     lut.ensure(sig.palette);
     emitter.clear(bounds.0 / 2.0);
 
+    // The gradient (the Gradient view, or the dimmed background of the
+    // other views) is no CPU geometry at all — the per-fragment gradient
+    // pipeline draws it from the field itself, pixel-exact. (A vertex
+    // grid was tried first: per-triangle color interpolation creases
+    // along every quad diagonal, and cell-corner sampling mosaics any
+    // sharp warp front.)
+    let (gradient_on, gradient_brightness) = match sig.mode {
+        FlowMode::Gradient => (true, 1.0),
+        FlowMode::Particles => (sig.background, 1.0 - BG_DIM_PARTICLES),
+        FlowMode::Streamlines | FlowMode::Arrows => (sig.background, 1.0 - BG_DIM_STROKES),
+    };
+    data.gradient_on = gradient_on;
+    data.gradient_brightness = gradient_brightness;
+    data.gradient_palette = FlowPalette::ALL
+        .iter()
+        .position(|palette| *palette == sig.palette)
+        .unwrap_or(0) as u32;
+    data.origin = bounds.0 / 2.0;
+    data.bounds = bounds.0;
+
     match sig.mode {
-        FlowMode::Particles => {
-            // The particles themselves are the dynamic layer; the static
-            // canvas is blank unless the dimmed gradient is on.
-            if sig.background {
-                emit_gradient(&mut emitter, &field, &lut, bounds.0, 1.0 - BG_DIM_PARTICLES);
-            }
-        }
-        FlowMode::Gradient => emit_gradient(&mut emitter, &field, &lut, bounds.0, 1.0),
-        FlowMode::Streamlines => {
-            if sig.background {
-                emit_gradient(&mut emitter, &field, &lut, bounds.0, 1.0 - BG_DIM_STROKES);
-            }
-            emit_streamlines(&mut emitter, &field, &lines, &lut, sig);
-        }
-        FlowMode::Arrows => {
-            if sig.background {
-                emit_gradient(&mut emitter, &field, &lut, bounds.0, 1.0 - BG_DIM_STROKES);
-            }
-            emit_arrows(&mut emitter, &field, &lut, sig);
-        }
+        // The particles themselves are the dynamic layer; the gradient
+        // pipeline covers the optional background.
+        FlowMode::Particles | FlowMode::Gradient => {}
+        FlowMode::Streamlines => emit_streamlines(&mut emitter, &field, &lines, &lut, sig),
+        FlowMode::Arrows => emit_arrows(&mut emitter, &field, &lut, sig),
     }
 
     // Swap, don't copy: the emitter inherits the old capacity back.
@@ -624,6 +607,7 @@ fn clear_when_inactive(
     data.static_vertices.clear();
     data.static_indices.clear();
     data.static_version = None;
+    data.gradient_on = false;
     data.meta.clear();
     particles.clear();
     state.applied = None;
@@ -640,6 +624,23 @@ fn clear_when_inactive(
 struct FlowShader {
     static_layer: Handle<Shader>,
     trails: Handle<Shader>,
+    gradient: Handle<Shader>,
+}
+
+/// The gradient shader's uniforms. Mirrors the WGSL `GradientParams`.
+#[derive(Clone, Copy, Default, ShaderType)]
+struct GradientParams {
+    /// Window center, for the window→world y-flip.
+    origin: Vec2,
+    /// Window size — the quad the vertex shader spans.
+    bounds: Vec2,
+    /// Field cell size in px.
+    scale: f32,
+    cols: u32,
+    rows: u32,
+    /// Index into `FlowPalette::ALL` (the shader's palette switch).
+    palette: u32,
+    brightness: f32,
 }
 
 /// GPU buffers for both layers.
@@ -658,6 +659,14 @@ struct FlowBuffers {
     trail_count: u32,
     trail_max_points: u32,
     trail_bind_group: Option<BindGroup>,
+    /// The gradient layer: the field's direction grid (uploaded only when
+    /// the field version moves) + its uniforms.
+    grad_dirs: RawBufferVec<[f32; 2]>,
+    grad_params: UniformBuffer<GradientParams>,
+    grad_on: bool,
+    grad_seen: Option<u64>,
+    grad_dirty: bool,
+    grad_bind_group: Option<BindGroup>,
 }
 
 impl Default for FlowBuffers {
@@ -674,6 +683,12 @@ impl Default for FlowBuffers {
             trail_count: 0,
             trail_max_points: TRAIL_CAP as u32,
             trail_bind_group: None,
+            grad_dirs: RawBufferVec::new(BufferUsages::STORAGE),
+            grad_params: UniformBuffer::default(),
+            grad_on: false,
+            grad_seen: None,
+            grad_dirty: false,
+            grad_bind_group: None,
         }
     }
 }
@@ -686,9 +701,32 @@ impl Default for FlowBuffers {
 fn extract_flow(
     data: Extract<Res<FlowDrawData>>,
     particles: Extract<Res<FlowParticles>>,
+    field: Extract<Res<FlowField>>,
     buffers: Option<ResMut<FlowBuffers>>,
 ) {
     let Some(mut buffers) = buffers else { return };
+    // The gradient layer: uniforms every frame (cheap), the direction
+    // grid only when the field version moved.
+    buffers.grad_on = data.gradient_on && field.cols > 0 && data.static_version.is_some();
+    if buffers.grad_on {
+        if buffers.grad_seen != data.static_version {
+            let dirs = buffers.grad_dirs.values_mut();
+            dirs.clear();
+            dirs.extend(field.dirs.iter().map(|dir| dir.to_array()));
+            buffers.grad_seen = data.static_version;
+            buffers.grad_dirty = true;
+        }
+        let params = GradientParams {
+            origin: data.origin,
+            bounds: data.bounds,
+            scale: field.scale,
+            cols: field.cols as u32,
+            rows: field.rows as u32,
+            palette: data.gradient_palette,
+            brightness: data.gradient_brightness,
+        };
+        buffers.grad_params.set(params);
+    }
     if data.meta.is_empty() {
         buffers.trail_count = 0;
     } else {
@@ -724,9 +762,11 @@ fn extract_flow(
 /// Upload — the static pair only when freshly extracted, the trail
 /// buffers every frame, plus the trail bind group (rebuilt each frame:
 /// `RawBufferVec` reallocations invalidate the old one).
+#[allow(clippy::too_many_arguments)]
 fn prepare_flow(
     mut buffers: ResMut<FlowBuffers>,
     pipeline: Option<Res<FlowTrailPipeline>>,
+    gradient_pipeline: Option<Res<FlowGradientPipeline>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -742,6 +782,29 @@ fn prepare_flow(
         }
         buffers.static_dirty = false;
     }
+
+    // The gradient layer's buffers + bind group (rebuilt per frame, like
+    // the trails': a `RawBufferVec` reallocation invalidates the old one).
+    buffers.grad_bind_group = None;
+    if let Some(gradient_pipeline) = gradient_pipeline.filter(|_| buffers.grad_on) {
+        if buffers.grad_dirty {
+            buffers
+                .grad_dirs
+                .write_buffer(&render_device, &render_queue);
+            buffers.grad_dirty = false;
+        }
+        buffers
+            .grad_params
+            .write_buffer(&render_device, &render_queue);
+        if let Some(dirs) = buffers.grad_dirs.buffer() {
+            buffers.grad_bind_group = Some(render_device.create_bind_group(
+                "flow_gradient",
+                &pipeline_cache.get_bind_group_layout(&gradient_pipeline.grad_layout),
+                &BindGroupEntries::sequential((&buffers.grad_params, dirs.as_entire_binding())),
+            ));
+        }
+    }
+
     buffers.trail_bind_group = None;
     let Some(pipeline) = pipeline else { return };
     if buffers.trail_count == 0 {
@@ -779,6 +842,16 @@ struct FlowTrailPipeline {
     trail_layout: BindGroupLayoutDescriptor,
 }
 
+/// The gradient layer's per-fragment pipeline: one quad over the window;
+/// the fragment shader samples the field (bilinear vector lerp) and runs
+/// the palette per pixel. Group 1: the uniform + the direction grid.
+#[derive(Resource)]
+struct FlowGradientPipeline {
+    mesh2d_pipeline: Mesh2dPipeline,
+    shader: Handle<Shader>,
+    grad_layout: BindGroupLayoutDescriptor,
+}
+
 fn init_flow_pipeline(
     mut commands: Commands,
     mesh2d_pipeline: Res<Mesh2dPipeline>,
@@ -803,6 +876,21 @@ fn init_flow_pipeline(
         mesh2d_pipeline: mesh2d_pipeline.clone(),
         shader: shader.trails.clone(),
         trail_layout,
+    });
+    let grad_layout = BindGroupLayoutDescriptor::new(
+        "flow_gradient_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::VERTEX_FRAGMENT,
+            (
+                uniform_buffer::<GradientParams>(false),
+                storage_buffer_read_only_sized(false, None), // direction grid
+            ),
+        ),
+    );
+    commands.insert_resource(FlowGradientPipeline {
+        mesh2d_pipeline: mesh2d_pipeline.clone(),
+        shader: shader.gradient.clone(),
+        grad_layout,
     });
 }
 
@@ -946,6 +1034,94 @@ impl SpecializedRenderPipeline for FlowTrailPipeline {
     }
 }
 
+impl SpecializedRenderPipeline for FlowGradientPipeline {
+    type Key = Mesh2dPipelineKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        let format = match key.contains(Mesh2dPipelineKey::HDR) {
+            true => ViewTarget::TEXTURE_FORMAT_HDR,
+            false => TextureFormat::bevy_default(),
+        };
+
+        RenderPipelineDescriptor {
+            label: Some("flow_gradient_pipeline".into()),
+            vertex: VertexState {
+                shader: self.shader.clone(),
+                // One window-covering quad, generated from vertex_index.
+                buffers: vec![],
+                ..default()
+            },
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                targets: vec![Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+                ..default()
+            }),
+            layout: vec![
+                self.mesh2d_pipeline.view_layout.clone(),
+                self.grad_layout.clone(),
+            ],
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                ..default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: CORE_2D_DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: CompareFunction::Always,
+                stencil: StencilState {
+                    front: StencilFaceState::IGNORE,
+                    back: StencilFaceState::IGNORE,
+                    read_mask: 0,
+                    write_mask: 0,
+                },
+                bias: DepthBiasState {
+                    constant: 0,
+                    slope_scale: 0.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: MultisampleState {
+                count: key.msaa_samples(),
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            ..default()
+        }
+    }
+}
+
+/// Draws the per-fragment gradient quad.
+struct DrawFlowGradient;
+
+impl<P: PhaseItem> RenderCommand<P> for DrawFlowGradient {
+    type Param = SRes<FlowBuffers>;
+    type ViewQuery = ();
+    type ItemQuery = ();
+
+    fn render<'w>(
+        _: &P,
+        _: ROQueryItem<'w, '_, Self::ViewQuery>,
+        _: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
+        buffers: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        let buffers = buffers.into_inner();
+        if !buffers.grad_on {
+            return RenderCommandResult::Success;
+        }
+        let Some(bind_group) = &buffers.grad_bind_group else {
+            return RenderCommandResult::Failure("flow gradient bind group not prepared");
+        };
+        pass.set_bind_group(1, bind_group, &[]);
+        pass.draw(0..6, 0..1);
+        RenderCommandResult::Success
+    }
+}
+
 /// Draws the static layer (the canvas equivalent).
 struct DrawFlowGeometry;
 
@@ -1020,31 +1196,43 @@ type DrawFlowTrails = (
     DrawFlowTrailsPull,
 );
 
-/// Queue the flow draws into every 2D view: the static layer, then the
-/// trails over it (a fractionally higher sort key keeps the order
-/// deterministic; no other experiment queues while flow owns the screen).
+type DrawFlowGradientLayer = (
+    SetItemPipeline,
+    SetMesh2dViewBindGroup<0>,
+    DrawFlowGradient,
+);
+
+/// Queue the flow draws into every 2D view: the gradient underneath, the
+/// static layer over it, the trails on top (fractionally increasing sort
+/// keys keep the order deterministic; no other experiment queues while
+/// flow owns the screen).
 #[allow(clippy::too_many_arguments)]
 fn queue_flow(
     transparent_draw_functions: Res<DrawFunctions<Transparent2d>>,
     flow_pipeline: Option<Res<FlowPipeline>>,
     trail_pipeline: Option<Res<FlowTrailPipeline>>,
+    gradient_pipeline: Option<Res<FlowGradientPipeline>>,
     mut pipelines: ResMut<SpecializedRenderPipelines<FlowPipeline>>,
     mut trail_pipelines: ResMut<SpecializedRenderPipelines<FlowTrailPipeline>>,
+    mut gradient_pipelines: ResMut<SpecializedRenderPipelines<FlowGradientPipeline>>,
     pipeline_cache: Res<PipelineCache>,
     buffers: Option<Res<FlowBuffers>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
     views: Query<(&ExtractedView, &Msaa)>,
 ) {
-    let (Some(flow_pipeline), Some(trail_pipeline), Some(buffers)) =
-        (flow_pipeline, trail_pipeline, buffers)
+    let (Some(flow_pipeline), Some(trail_pipeline), Some(gradient_pipeline), Some(buffers)) =
+        (flow_pipeline, trail_pipeline, gradient_pipeline, buffers)
     else {
         return;
     };
-    if buffers.static_index_count == 0 && buffers.trail_count == 0 {
+    if buffers.static_index_count == 0 && buffers.trail_count == 0 && !buffers.grad_on {
         return;
     }
     let draw_flow = transparent_draw_functions.read().id::<DrawFlow>();
     let draw_trails = transparent_draw_functions.read().id::<DrawFlowTrails>();
+    let draw_gradient = transparent_draw_functions
+        .read()
+        .id::<DrawFlowGradientLayer>();
 
     for (view, msaa) in &views {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
@@ -1069,13 +1257,18 @@ fn queue_flow(
                 indexed,
             });
         };
+        if buffers.grad_on {
+            let pipeline_id =
+                gradient_pipelines.specialize(&pipeline_cache, &gradient_pipeline, key);
+            item(draw_gradient, pipeline_id, 0.0, false);
+        }
         if buffers.static_index_count > 0 {
             let pipeline_id = pipelines.specialize(&pipeline_cache, &flow_pipeline, key);
-            item(draw_flow, pipeline_id, 0.0, true);
+            item(draw_flow, pipeline_id, 0.001, true);
         }
         if buffers.trail_count > 0 {
             let pipeline_id = trail_pipelines.specialize(&pipeline_cache, &trail_pipeline, key);
-            item(draw_trails, pipeline_id, 0.001, false);
+            item(draw_trails, pipeline_id, 0.002, false);
         }
     }
 }
@@ -1246,6 +1439,134 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 ";
 
+// The gradient layer's per-fragment shader: one quad over the window;
+// every pixel samples the field with the same edge-clamped bilinear
+// direction lerp as the sim (`FlowField::sample_dir`) and runs the Lua
+// palette formulas itself. A vertex-color grid was tried first and reads
+// blocky two ways: per-TRIANGLE interpolation creases along every quad
+// diagonal, and sampling colors only at cell corners mosaics sharp warp
+// fronts. Per-fragment is exact at any scale. Colors come out premultiplied
+// with alpha 1 (an opaque base layer), dimmed by `brightness` when serving
+// as the background of another view.
+const FLOW_GRADIENT_SHADER: &str = r"
+#import bevy_sprite::mesh2d_view_bindings::view
+
+struct GradientParams {
+    origin: vec2<f32>,
+    bounds: vec2<f32>,
+    scale: f32,
+    cols: u32,
+    rows: u32,
+    palette: u32,
+    brightness: f32,
+};
+
+@group(1) @binding(0) var<uniform> params: GradientParams;
+@group(1) @binding(1) var<storage, read> dirs: array<vec2<f32>>;
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    // Window-space position, interpolated per fragment.
+    @location(0) window: vec2<f32>,
+};
+
+@vertex
+fn vertex(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    // Two triangles covering the window: (0,0)(1,0)(0,1) / (1,0)(1,1)(0,1).
+    var corner: vec2<f32>;
+    switch vi {
+        case 0u: { corner = vec2<f32>(0.0, 0.0); }
+        case 1u: { corner = vec2<f32>(1.0, 0.0); }
+        case 2u: { corner = vec2<f32>(0.0, 1.0); }
+        case 3u: { corner = vec2<f32>(1.0, 0.0); }
+        case 4u: { corner = vec2<f32>(1.0, 1.0); }
+        default: { corner = vec2<f32>(0.0, 1.0); }
+    }
+    let window = corner * params.bounds;
+    let world = vec2<f32>(window.x - params.origin.x, params.origin.y - window.y);
+    var out: VertexOutput;
+    out.clip_position = view.clip_from_world * vec4<f32>(world, 0.0, 1.0);
+    out.window = window;
+    return out;
+}
+
+fn dir_at(c: i32, r: i32) -> vec2<f32> {
+    return dirs[u32(r) * params.cols + u32(c)];
+}
+
+// The Lua's hsv2rgb (h degrees, s/v percent), sRGB out.
+fn hsv2rgb(h_deg: f32, s_pct: f32, v_pct: f32) -> vec3<f32> {
+    let h = fract(h_deg / 360.0);
+    let s = s_pct / 100.0;
+    let v = v_pct / 100.0;
+    let i = floor(h * 6.0);
+    let f = h * 6.0 - i;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    switch (i32(i) % 6) {
+        case 0: { return vec3<f32>(v, t, p); }
+        case 1: { return vec3<f32>(q, v, p); }
+        case 2: { return vec3<f32>(p, v, t); }
+        case 3: { return vec3<f32>(p, q, v); }
+        case 4: { return vec3<f32>(t, p, v); }
+        default: { return vec3<f32>(v, p, q); }
+    }
+}
+
+// lib/flow.lua's PALETTES, indexed like FlowPalette::ALL.
+fn palette(t: f32) -> vec3<f32> {
+    switch params.palette {
+        case 0u: { return hsv2rgb(t * 360.0, 80.0, 95.0); }
+        case 1u: { return hsv2rgb(175.0 + t * 85.0, 65.0, 45.0 + t * 50.0); }
+        case 2u: { return hsv2rgb(t * 55.0, 90.0, 55.0 + t * 45.0); }
+        case 3u: { return hsv2rgb(75.0 + t * 95.0, 65.0, 45.0 + t * 50.0); }
+        default: {
+            let v = 0.2 + 0.75 * t;
+            return vec3<f32>(v, v, v);
+        }
+    }
+}
+
+// Exact sRGB -> linear (the palettes are authored in sRGB; the
+// framebuffer encodes back on write).
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
+const TAU: f32 = 6.28318530718;
+
+@fragment
+fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Edge-clamped bilinear over the four surrounding cell centers'
+    // direction vectors — the sim's sample_dir, per pixel.
+    let cols = i32(params.cols);
+    let rows = i32(params.rows);
+    let gx = clamp(in.window.x / params.scale - 0.5, 0.0, f32(cols - 1));
+    let gy = clamp(in.window.y / params.scale - 0.5, 0.0, f32(rows - 1));
+    let c0 = i32(gx);
+    let r0 = i32(gy);
+    let c1 = min(c0 + 1, cols - 1);
+    let r1 = min(r0 + 1, rows - 1);
+    let fx = gx - f32(c0);
+    let fy = gy - f32(r0);
+    let top = mix(dir_at(c0, r0), dir_at(c1, r0), fx);
+    let bottom = mix(dir_at(c0, r1), dir_at(c1, r1), fx);
+    var dir = mix(top, bottom, fy);
+    if (dot(dir, dir) < 1e-8) {
+        // Opposing neighbours cancelled; fall back to the nearest cell.
+        dir = dir_at(i32(round(gx)), i32(round(gy)));
+    }
+    let angle = atan2(dir.y, dir.x);
+    let t = fract(angle / TAU);
+    let rgb = srgb_to_linear(palette(t)) * params.brightness;
+    // Premultiplied, alpha 1: an opaque base layer.
+    return vec4<f32>(rgb, 1.0);
+}
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,29 +1663,19 @@ mod tests {
         assert_eq!(color >> 24, 255);
     }
 
-    /// The gradient grid covers the viewport corners exactly and indexes
-    /// every cell.
+    /// The gradient shader's `palette()` switch is written against the
+    /// exact order of `FlowPalette::ALL` — pin it.
     #[test]
-    fn gradient_grid_covers_the_viewport() {
-        let field = FlowField {
-            cols: 4,
-            rows: 3,
-            scale: 10.0,
-            angles: vec![0.0; 12],
-            dirs: vec![Vec2::X; 12],
-        };
-        let mut lut = FlowPaletteLut::default();
-        lut.ensure(FlowPalette::Rainbow);
-        let mut emitter = FlowEmitter::default();
-        let bounds = Vec2::new(100.0, 60.0);
-        emitter.clear(bounds / 2.0);
-        emit_gradient(&mut emitter, &field, &lut, bounds, 1.0);
-        assert_eq!(emitter.vertices.len(), 5 * 4);
-        assert_eq!(emitter.indices.len(), 4 * 3 * 6);
-        // Window corners → world corners (y-flipped around the center).
-        let first = emitter.vertices.first().unwrap().pos;
-        let last = emitter.vertices.last().unwrap().pos;
-        assert_eq!(first, [-50.0, 30.0]);
-        assert_eq!(last, [50.0, -30.0]);
+    fn gradient_palette_index_matches_the_shader_switch() {
+        assert_eq!(
+            FlowPalette::ALL,
+            [
+                FlowPalette::Rainbow,
+                FlowPalette::Ocean,
+                FlowPalette::Fire,
+                FlowPalette::Forest,
+                FlowPalette::Mono,
+            ]
+        );
     }
 }
