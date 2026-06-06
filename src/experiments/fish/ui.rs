@@ -25,6 +25,7 @@ pub fn plugin(app: &mut App) {
         (
             toggle_wave_checkbox,
             sync_wave_widgets,
+            sync_school_rows,
             (update_score, reset_settings).run_if(experiment_active(ExperimentId::Fish)),
         ),
     );
@@ -43,6 +44,11 @@ struct WaveCheckMark;
 #[derive(Component)]
 struct WaveRow;
 
+/// Rows only visible while more than one fish swims — the school
+/// minigame's steering weights, which do nothing to a lone fish.
+#[derive(Component)]
+struct SchoolRow;
+
 /// The fish's options-popup content: instructions, three sliders, the
 /// wiggle checkbox, and the wave sliders it reveals.
 fn spawn_popup(mut commands: Commands, settings: Res<FishSettings>, vsync: Res<VsyncEnabled>) {
@@ -57,6 +63,9 @@ fn spawn_popup(mut commands: Commands, settings: Res<FishSettings>, vsync: Res<V
         |body: &mut ChildSpawner| {
             for param in FishParam::MAIN {
                 spawn_slider(body, (), param, &settings, 14.0);
+            }
+            for param in FishParam::SCHOOL {
+                spawn_slider(body, SchoolRow, param, &settings, 14.0);
             }
             spawn_checkbox(
                 body,
@@ -108,6 +117,23 @@ fn sync_wave_widgets(
         } else {
             Display::None
         };
+    }
+}
+
+/// Show the school's steering-weight rows only while the Fish count is
+/// above 1 — dragging the count slider past 1 reveals them live, the
+/// same `visibleIf` idea as the wave rows.
+fn sync_school_rows(
+    settings: Res<FishSettings>,
+    added: Query<(), Added<SchoolRow>>,
+    mut rows: Query<&mut Node, With<SchoolRow>>,
+) {
+    if !settings.is_changed() && added.is_empty() {
+        return;
+    }
+    let school = settings.count.round() as usize > 1;
+    for mut node in &mut rows {
+        node.display = if school { Display::Flex } else { Display::None };
     }
 }
 

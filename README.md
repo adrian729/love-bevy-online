@@ -1,13 +1,16 @@
 # love-bevy-online — the LÖVE experiments in Bevy/Rust
 
-A Bevy port of the LÖVE/Lua `love-online` project: a start menu with the
-live experiment animating behind it, and — so far — one experiment,
-**flock** (Reynolds boids). Same simulation rules, same tunables, same UI
-behaviour — rebuilt on Bevy to see how far the same experiment can be
-pushed in Rust.
+A Bevy port of the LÖVE/Lua `love-online` project: a start menu with a
+live experiment animating behind it, and two experiments so far —
+**flock** (Reynolds boids) and **fish** (a procedural FABRIK fish that
+grows by eating, swimming as a whole school of boids once the Fish slider
+goes past 1). Same simulation rules, same tunables, same UI behaviour —
+rebuilt on Bevy to see how far the same experiments can be pushed in Rust.
 
 Answer so far: **the LÖVE original capped at 300 boids; this port holds
-~100+ fps at 640,000**, with the slider allowing 1.28 million.
+~100+ fps at 640,000**, with the slider allowing 1.28 million. The fish
+school holds ~100+ fps at 4,096 spline-rendered fish (the original's
+school suggested raising past ~30 "with care"), slider allowing 8,192.
 
 ```sh
 cargo run            # dev profile: fast iteration (dynamic linking, opt-level 1)
@@ -132,8 +135,11 @@ boots straight into the experiment, so harness numbers stay comparable
 across versions. Flags compose:
 
 - `fish` — perf-test the fish experiment instead of the flock: `<count>`
-  fish chase per-fish wander targets (`pin`: all pile onto the centre).
-  Certified ~4096 at ≥~100 fps on the M4 Pro; see ARCHITECTURE.md.
+  fish swim as the real school-of-boids path (`pin`: the cursor parks at
+  the centre and the whole school piles onto it — the sustained worst
+  case; without `pin`, headless runs have no pointer and the school
+  flocks freely). Certified: a school of 4096 at ≥~100 fps on the M4
+  Pro; see ARCHITECTURE.md.
 - `pin` — fake mouse attractor at screen centre (sustained worst case).
 - `headless` — no window: renders to an offscreen texture, schedule
   free-runs, and a snapshot lands in `/tmp/boids_headless_{0,1,2}.png`
@@ -180,7 +186,8 @@ target-gated.
 | SUIT immediate-mode sliders/buttons | Hand-rolled retained `bevy_ui` sliders (`Interaction::Pressed` persists through a drag) |
 | `pointerOverUI` → `ignore_mouse` | `PointerOverUi` resource |
 | `state = 'menu' / 'playing' / 'options'` | `States` enum; sim steps in `Menu` (the live backdrop) and `Playing`, popup on `OnEnter(Options)` |
-| `minigames` registry + menu backdrop pool | `src/experiments/` registry; the flock is the only entry (and backdrop) so far |
+| `minigames` registry + menu backdrop pool | `src/experiments/` registry; flock + fish, random backdrop per menu visit |
+| `school.lua` (boids of fish, its own minigame) | The fish experiment's "Fish" slider: count > 1 swims the school's boids rules, food objective kept |
 
 Steering constants kept from the original: `max_force 0.3`, separation radius
 50 px, neighbour radius 100 px, mouse attract `k = 4` / repel `k = -6` inside
@@ -188,8 +195,26 @@ Steering constants kept from the original: `max_force 0.3`, separation radius
 
 Deliberate differences:
 
-- The menu lists one experiment so far (the original had five); a random
-  backdrop pool comes back once there is something to pick between.
+- The menu lists two experiments so far (the original had five), with a
+  random backdrop picked per visit like the original's pool.
+- The original kept "fish" and "school" as separate minigames; here the
+  school is the fish experiment's count slider — and unlike the original's
+  school, the fish still eat (the food gently pulls fish within 100 px,
+  or a cursor-parked school could never reach it through its own mouse
+  repulsion). The school minigame's separation/alignment/cohesion
+  tunables appear in the popup whenever more than one fish swims.
+- School fish never snap. The original's forces can reverse a boid's
+  whole velocity between two frames (the bang-bang attract/repel ring,
+  separation conflicts in any close pass) — invisible on triangles,
+  a flickering whip on spline fish bodies. Here every school velocity
+  runs through a slew limiter (headings turn at most ~5 rad/s, speeds
+  relax through a short low-pass): the steering rules are still the
+  ported ones, but the fish respond to them like creatures with
+  momentum. On top of that, once the pointer rests, fish that have
+  reached it settle into a slow mill around it — the single fish's
+  stationary-pointer orbit, schooled. Pointer movement releases the
+  mill instantly, and the food pull rides outside it, so a milling
+  school still dives and eats.
 - An FPS readout under the score, to compare runtimes (the point of the
   experiment) — plus a VSync checkbox in the options popup, so a normal run
   can uncap presentation without the perf harness. Heads-up when reading

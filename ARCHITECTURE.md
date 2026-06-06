@@ -56,19 +56,60 @@ against, and survives as its own artifact (~320k boids at ~125 fps).
 ## The fish experiment (`src/experiments/fish/`)
 
 A port of the original's `minigames/fish.lua` + `lib/{fish,chain,joint,
-vec2,splines}.lua`: one procedural 12-joint FABRIK fish that chases the
-cursor, orbits it when it rests, and grows by eating food. Deliberately NOT
-built on the flock's machinery — different problem, different shape:
+vec2,splines}.lua`: a procedural 12-joint FABRIK fish that chases the
+cursor, orbits it when it rests, and grows by eating food — plus a "Fish"
+count tunable that folds in the original's *school* minigame
+(`lib/school.lua`): more than one fish swims as a school of boids while
+the food rules keep working. Deliberately NOT built on the flock's
+machinery — different problem, different shape:
 
-- `sim.rs` — the FABRIK spine and minigame rules, in **window coordinates**
-  (top-left, y-down) so every Lua formula ports sign-identical and the
-  cursor needs no transform. Port-parity is pinned by tests whose expected
-  values come from running the actual Lua under LuaJIT (a 180-frame spine
-  trajectory matches every joint within 0.05px; the `renderV2` spline and
-  `constrainAngle` match to 1e-3). State is a plain `Vec<Fish>`: the game
-  drives one from the mouse, the perf harness (`<count> fish`) drives many
-  from wander targets, and a future school can drive each via
-  `Fish::set_target(target, dir)` — the original `school.lua`'s contract.
+- `sim.rs` — the FABRIK spine, the minigame rules, and the school, all in
+  **window coordinates** (top-left, y-down) so every Lua formula ports
+  sign-identical and the cursor needs no transform. Port-parity is pinned
+  by tests whose expected values come from running the actual Lua under
+  LuaJIT (a 180-frame spine trajectory matches every joint within 0.05px;
+  the `renderV2` spline and `constrainAngle` match to 1e-3; the school
+  boids match `lib/school.lua` across 60 per-frame-resynced steps — a
+  free-run comparison is meaningless for a chaotic system). State is a
+  plain `Vec<Fish>`: at count 1 the game drives it from the mouse
+  (byte-identical to the pre-school fish game); at count > 1 a `School`
+  of boids (the school's own constants: max_force 0.6, separate 75,
+  neighbour 150, mouse attract/repel 4/−6 at 50px, no screen wrap; the
+  separation/alignment/cohesion weights are the school minigame's live
+  tunables, surfaced as popup sliders whenever count > 1) drives each
+  fish via `Fish::set_target(pos, vel)` — the original
+  `school.lua`'s contract; spine heads are never written back. Any fish
+  that touches the food eats it and grows. One addition the original
+  never needed: the food pulls fish within 100px (`steer_to_target`'s
+  unused target mechanism, k = 10) — without it the mouse's −6 repulsion
+  makes a cursor-parked school physically unable to reach the food
+  (`school_reaches_the_food` proves the contract, and
+  `school_stays_steerable_away_from_food` the player's control). A
+  second addition: **smoothing**, in two layers, because the Lua forces
+  routinely exceed the speed cap per frame (the bang-bang mouse ring,
+  separation conflicts in close passes) and can reverse a boid's full
+  velocity between two frames — invisible on triangles, a flickering
+  whip on spline fish bodies whose wave offset also flips sides with
+  the velocity. Layer one, always on: a slew limiter — headings turn at
+  most 5 rad/s (a U-turn is a ~0.6s arc; the flicker needs ~π per
+  frame), speeds relax through a 0.1s low-pass; the forces stay as
+  ported, only the velocity's response is made continuous
+  (`school_never_snaps_headings` stress-drives a packed blob through a
+  sweeping, resting, then bolting cursor and asserts the bound on every
+  fish every frame). Layer two: once the pointer has rested ~¼s, fish
+  within 200px (fully inside 100px) aim for a slow tangential mill
+  around it (0.6·max_speed on a ~70px ring — fast enough to keep FABRIK
+  targets past the chain's 2px freeze threshold), capped at an 0.85
+  blend so separation keeps spacing the pile. The food impulse is
+  integrated outside the mill blend, so a calmed school still dives and
+  eats; pointer movement resets the blend instantly
+  (`school_calms_into_a_mill_at_idle_pointer`,
+  `moving_pointer_keeps_the_school_raw`). The parity tests run the
+  integration with both layers off — that path is the Lua one. Above
+  128 neighbour candidates the 3x3 scan samples proportional salted
+  blocks per bucket — the flock's `MAX_NEIGHBOUR_SAMPLES` trick,
+  re-derived (the steering only uses aggregate directions); below the
+  cap the scan is exhaustive and Lua-exact.
 - `render.rs` — per-frame vector geometry in the original's painter order
   (food, lateral fins, tail, body, dorsal, eyes), each part splined with
   the original's Hermite "v2" algorithm (NOT Catmull-Rom), 0.5px-deduped,
@@ -85,12 +126,17 @@ ear clipping, pooled scratch buffers, fish-parallel build + parallel
 concatenation on the compute pool). Triangles reach the GPU through a
 custom 12-byte vertex (pos f32x2 + unorm color) and persistent
 `RawBufferVec`s — the `Assets<Mesh>` path re-interleaved and re-copied
-the full mesh every frame and dominated past ~2k fish. Certified: ~4096
-fish ≥ ~100 fps (≈150 in clean windows; `pin` pile-up is *faster* — the
-FABRIK early-out freezes arrived fish). 8192 reads ~76–93: the floor is
-per-fish CPU geometry plus ~78MB/frame of vertex traffic; the identified
-next lever is GPU-side geometry generation from uploaded spines
-(~1MB/frame), an investment of the same shape as the flock's compute sim.
+the full mesh every frame and dominated past ~2k fish. The school's
+boids pass is parallel and sample-capped (uncapped, a pinned 4096-fish
+pile is O(n²): ~12 fps; capped + chunked it reads ~157 — and ~170–211
+once the calm regime spreads a pinned pile into its even milling
+annulus). Certified:
+**a school of 4096 ≥ ~100 fps** (~143–178 pinned in this loop's windows);
+the count slider allows 8192 (2x certified, the flock's convention),
+which reads ~77–99 pinned. The floor there is per-fish CPU geometry plus
+~78MB/frame of vertex traffic; the identified next lever is GPU-side
+geometry generation from uploaded spines (~1MB/frame), an investment of
+the same shape as the flock's compute sim.
 
 ## Boids are plain data, not entities
 

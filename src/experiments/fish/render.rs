@@ -166,10 +166,11 @@ fn rebuild_geometry(
     let origin = bounds.0 / 2.0;
     emitter.clear(origin);
 
-    // The food dot draws first (minigames/fish.lua draw order); only the
-    // single-fish game has one.
-    if let [fish] = fishes.0.as_slice() {
-        let r = (fish.scale * 20.0).min(10.0);
+    // The food dot draws first (minigames/fish.lua draw order). Any fish
+    // can eat it — one or a whole school — so its radius tracks the
+    // biggest fish (identical to the original with a single fish).
+    if let Some(max_scale) = fishes.0.iter().map(|fish| fish.scale).reduce(f32::max) {
+        let r = (max_scale * 20.0).min(10.0);
         emitter.fill_circle(game.food, r, palette().food);
         emitter.stroke_circle(game.food, r, palette().white);
     }
@@ -205,16 +206,23 @@ fn rebuild_geometry(
         // Concatenate in parallel too: at thousands of fish this is tens of
         // megabytes, and a serial merge was a measurable slice of the frame.
         // Each chunk copies into its own disjoint slice of the output,
-        // offsetting its indices on the way.
-        let total_vertices: usize = buffers.iter().map(|(e, _)| e.vertices.len()).sum();
-        let total_indices: usize = buffers.iter().map(|(e, _)| e.indices.len()).sum();
+        // offsetting its indices on the way. The main emitter (the food,
+        // emitted above) is the prefix: copied verbatim — its indices are
+        // already 0-based — while every fish chunk's indices shift past
+        // its vertices via the `base` starting value.
+        let total_vertices: usize =
+            emitter.vertices.len() + buffers.iter().map(|(e, _)| e.vertices.len()).sum::<usize>();
+        let total_indices: usize =
+            emitter.indices.len() + buffers.iter().map(|(e, _)| e.indices.len()).sum::<usize>();
         let FishDrawData { vertices, indices } = &mut *data;
         vertices.resize(total_vertices, FishVertex::zeroed());
         indices.resize(total_indices, 0);
         pool.scope(|scope| {
-            let mut vertex_rest = vertices.as_mut_slice();
-            let mut index_rest = indices.as_mut_slice();
-            let mut base = 0u32;
+            let (vertex_prefix, mut vertex_rest) = vertices.split_at_mut(emitter.vertices.len());
+            let (index_prefix, mut index_rest) = indices.split_at_mut(emitter.indices.len());
+            vertex_prefix.copy_from_slice(&emitter.vertices);
+            index_prefix.copy_from_slice(&emitter.indices);
+            let mut base = emitter.vertices.len() as u32;
             for (chunk_emitter, _) in buffers.iter() {
                 let (vertex_slice, rest) = vertex_rest.split_at_mut(chunk_emitter.vertices.len());
                 vertex_rest = rest;
