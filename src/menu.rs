@@ -1,12 +1,13 @@
-//! The main menu (state `Menu`), mirroring the original's menu screen: the
-//! active experiment animates as a live backdrop — mouse ignored, like
-//! `menuBg:update(dt, true)` — dimmed under a translucent overlay, with one
-//! button per experiment in the registry.
+//! The main menu (state `Menu`), mirroring the original's menu screen: a
+//! random experiment animates as a live backdrop — picked fresh on every
+//! menu visit, the original's `pickMenuBg` — dimmed under a translucent
+//! overlay, with one button per experiment in the registry.
 
 use bevy::prelude::*;
+use rand::Rng;
 
 use crate::app::{AppState, RestartRequested};
-use crate::experiments::{EXPERIMENTS, ExperimentId};
+use crate::experiments::{CurrentExperiment, EXPERIMENTS, ExperimentId};
 use crate::ui::spawn_button;
 
 pub fn plugin(app: &mut App) {
@@ -26,10 +27,16 @@ struct MenuRoot;
 #[derive(Component, Clone, Copy)]
 struct StartExperiment(ExperimentId);
 
-/// The menu column over the dimmed backdrop. Entering the menu also
-/// respawns the backdrop flock — the original picks and resets a fresh
-/// backdrop on every menu visit.
-fn spawn_menu(mut commands: Commands, mut restart: ResMut<RestartRequested>) {
+/// The menu column over the dimmed backdrop. Entering the menu also picks a
+/// random backdrop experiment and respawns it — the original picks and
+/// resets a fresh one from `menuBgPool` on every visit (which also keeps
+/// the fish from growing unbounded if someone lingers on the menu).
+fn spawn_menu(
+    mut commands: Commands,
+    mut current: ResMut<CurrentExperiment>,
+    mut restart: ResMut<RestartRequested>,
+) {
+    current.0 = EXPERIMENTS[rand::rng().random_range(0..EXPERIMENTS.len())].id;
     restart.0 = true;
     commands
         .spawn((
@@ -73,10 +80,11 @@ fn despawn_menu(mut commands: Commands, menus: Query<Entity, With<MenuRoot>>) {
     }
 }
 
-/// A click on an experiment's button starts it fresh, like the original's
-/// `current:reset()` on selection.
+/// A click on an experiment's button makes it current and starts it fresh,
+/// like the original's `current:reset()` on selection.
 fn start_experiment(
     buttons: Query<(&Interaction, &StartExperiment), Changed<Interaction>>,
+    mut current: ResMut<CurrentExperiment>,
     mut restart: ResMut<RestartRequested>,
     mut next: ResMut<NextState<AppState>>,
 ) {
@@ -84,12 +92,9 @@ fn start_experiment(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        match start.0 {
-            ExperimentId::Flock => {
-                restart.0 = true;
-                next.set(AppState::Playing);
-            }
-        }
+        current.0 = start.0;
+        restart.0 = true;
+        next.set(AppState::Playing);
     }
 }
 

@@ -21,27 +21,35 @@ mod menu;
 mod ui;
 
 use app::AppState;
-use experiments::flock;
+use experiments::{CurrentExperiment, ExperimentId, fish, flock};
 
 fn main() {
-    // Perf-test mode (`boids <count> [pin] [headless] [nosim]`): print fps to
-    // stdout once a second, with vsync off so readings show real headroom
-    // past the display's refresh rate.
+    // Perf-test mode (`boids <count> [fish] [pin] [headless] [nosim]`):
+    // print fps to stdout once a second, with vsync off so readings show
+    // real headroom past the display's refresh rate. The count is boids by
+    // default, fish with the `fish` flag.
+    //   fish     — perf-test the fish experiment instead of the flock.
     //   pin      — fake mouse attractor at screen centre: the sustained worst
-    //              case (the whole flock piled into a ring).
+    //              case (the whole flock piled into a ring / fish stacked on
+    //              one spot).
     //   headless — no window at all; the camera renders to an offscreen
     //              texture and the schedule free-runs. Exercises the full
     //              sim + extract + batch + GPU pipeline, immune to display
     //              sleep / occlusion throttling (macOS caps presentation on
     //              occluded or sleeping displays, poisoning fps readings).
-    //   nosim    — skip steering, isolating the render/ECS floor.
+    //   nosim    — skip steering, isolating the render/ECS floor (flock).
     //   geo      — render the original 12-vertex boid geometry instead of
-    //              the baked-texture quads (the visual reference).
+    //              the baked-texture quads (the visual reference, flock).
     let perf_mode = std::env::args().nth(1).is_some();
-    let flag = |name: &str| std::env::args().skip(2).any(|arg| arg == name);
+    let flag = |name: &str| std::env::args().skip(1).any(|arg| arg == name);
     let pin = flag("pin");
     let headless = flag("headless");
     let quads = !flag("geo");
+    let experiment = if flag("fish") {
+        ExperimentId::Fish
+    } else {
+        ExperimentId::Flock
+    };
 
     let mut bevy_app = App::new();
     if headless {
@@ -83,7 +91,14 @@ fn main() {
         .insert_resource(app::VsyncEnabled(!perf_mode))
         .insert_resource(app::PinnedAttractor(pin))
         .insert_resource(app::HeadlessRender(headless))
-        .add_plugins((app::plugin, flock::FlockPlugin { quads, headless }));
+        // Perf runs pin the chosen experiment; a normal launch starts on
+        // the menu, which re-picks a random backdrop on entry anyway.
+        .insert_resource(CurrentExperiment(experiment))
+        .add_plugins((
+            app::plugin,
+            flock::FlockPlugin { quads, headless },
+            fish::FishPlugin { headless },
+        ));
 
     // Perf runs (any CLI arg) skip the menu and boot straight into the
     // experiment, so the harness numbers stay comparable across versions —
@@ -96,12 +111,10 @@ fn main() {
     }
 
     // The UI and the menu need a window; everything else runs the same
-    // headless. The flock's UI plugin owns FrameTimeDiagnosticsPlugin (for
-    // its fps readout), so the headless path registers it itself for
-    // `print_fps`.
-    if headless {
-        bevy_app.add_plugins(FrameTimeDiagnosticsPlugin::default());
-    } else {
+    // headless. Frame diagnostics feed both the HUD's fps readout and
+    // `print_fps`, so they register once here.
+    bevy_app.add_plugins(FrameTimeDiagnosticsPlugin::default());
+    if !headless {
         bevy_app.add_plugins((ui::plugin, menu::plugin));
     }
     // Uses println! rather than Bevy's LogDiagnosticsPlugin — the latter logs

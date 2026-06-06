@@ -41,6 +41,7 @@ use rand::Rng;
 
 use super::settings::{NEIGHBOUR_DIST, SimSettings};
 use crate::app::{AppState, PinnedAttractor, PointerOverUi, RestartRequested, SimBounds};
+use crate::experiments::{CurrentExperiment, ExperimentId};
 
 /// Buffer capacity in boids — two more doublings of headroom past the
 /// current slider maximum. ~150 MB of GPU memory all-in at this size.
@@ -103,6 +104,7 @@ fn gpu_sync_flock(
     pointer_over_ui: Res<PointerOverUi>,
     pinned: Res<PinnedAttractor>,
     state: Res<State<AppState>>,
+    current: Res<CurrentExperiment>,
     keys: Res<ButtonInput<KeyCode>>,
     mut restart: ResMut<RestartRequested>,
     mut count: ResMut<GpuFlockCount>,
@@ -115,6 +117,17 @@ fn gpu_sync_flock(
     // Last frame's uploads have been extracted; start fresh.
     spawns.upload.clear();
     spawns.base = count.0 as u32;
+
+    // Another experiment owns the screen: drop to zero boids — the
+    // renderer skips the draw at count 0 — and regrow fresh on return.
+    // (Options merely pauses: the flock stays visible, frozen.)
+    if current.0 != ExperimentId::Flock {
+        count.0 = 0;
+        spawns.base = 0;
+        params.count = 0;
+        run.0 = false;
+        return;
+    }
 
     // The sim also steps behind the menu (the live backdrop); the R key
     // only restarts during actual play.

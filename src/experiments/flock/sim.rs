@@ -25,6 +25,7 @@ use crate::app::{
     AppState, PinnedAttractor, PointerOverUi, RestartRequested, SimBounds, sim_active,
     update_sim_bounds,
 };
+use crate::experiments::{CurrentExperiment, ExperimentId, experiment_active};
 
 /// True when this run simulates on the CPU (the `cpu` or `nosim` perf
 /// flags); the GPU compute sim is the default otherwise.
@@ -37,19 +38,35 @@ pub fn plugin(app: &mut App) {
     // skip steering, to measure the render floor in isolation.
     let nosim = std::env::args().any(|arg| arg == "nosim");
     let cpu = cpu_sim_selected();
-    app.init_resource::<Flock>().add_systems(
-        Update,
-        (
-            handle_restart,
-            sync_flock_size,
-            flocking.run_if(move || !nosim),
+    app.init_resource::<Flock>()
+        .add_systems(
+            Update,
+            (
+                handle_restart,
+                sync_flock_size,
+                flocking.run_if(move || !nosim),
+            )
+                .chain()
+                .after(update_sim_bounds)
+                .run_if(move || cpu)
+                .run_if(experiment_active(ExperimentId::Flock))
+                // Steps while playing AND behind the menu (the live backdrop).
+                .run_if(sim_active),
         )
-            .chain()
-            .after(update_sim_bounds)
-            .run_if(move || cpu)
-            // Steps while playing AND behind the menu (the live backdrop).
-            .run_if(sim_active),
-    );
+        // When another experiment takes over, drop the boids so nothing is
+        // drawn; returning regrows a fresh flock (the menuBg reset).
+        .add_systems(Update, clear_on_deactivate);
+}
+
+fn clear_on_deactivate(
+    current: Res<CurrentExperiment>,
+    mut flock: ResMut<Flock>,
+    mut instances: ResMut<FlockRenderData>,
+) {
+    if current.is_changed() && current.0 != ExperimentId::Flock {
+        flock.0.clear();
+        instances.0.clear();
+    }
 }
 
 /// One boid: position and velocity in world px / px-per-second.

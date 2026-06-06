@@ -19,8 +19,12 @@ registry. A thin shared shell wraps the experiments:
   shared between it and the experiments' own UI.
 - `src/experiments/mod.rs` — the registry the menu lists. Each experiment is
   a folder of plugins under `src/experiments/`; plugins register once at
-  startup, so a second experiment will gate its systems on a
-  `CurrentExperiment` resource rather than being loaded on demand.
+  startup and gate their systems on the `CurrentExperiment` resource (set by
+  the menu, which also picks a random backdrop per visit — `menuBgPool`).
+  The chrome the original kept in `main.lua` — HUD (score/fps/hint), the
+  options-popup shell with its nav buttons, [Esc]/[O] pause, the generic
+  slider (`SliderBinding`) and checkbox widgets — lives in `src/ui.rs`;
+  experiments contribute only their own content.
 
 The flock experiment itself (`src/experiments/flock/`):
 
@@ -48,6 +52,45 @@ The flock experiment itself (`src/experiments/flock/`):
 Two interchangeable simulations feed one renderer. Both implement exactly the
 same rules; the CPU one is the readable reference the GPU one is verified
 against, and survives as its own artifact (~320k boids at ~125 fps).
+
+## The fish experiment (`src/experiments/fish/`)
+
+A port of the original's `minigames/fish.lua` + `lib/{fish,chain,joint,
+vec2,splines}.lua`: one procedural 12-joint FABRIK fish that chases the
+cursor, orbits it when it rests, and grows by eating food. Deliberately NOT
+built on the flock's machinery — different problem, different shape:
+
+- `sim.rs` — the FABRIK spine and minigame rules, in **window coordinates**
+  (top-left, y-down) so every Lua formula ports sign-identical and the
+  cursor needs no transform. Port-parity is pinned by tests whose expected
+  values come from running the actual Lua under LuaJIT (a 180-frame spine
+  trajectory matches every joint within 0.05px; the `renderV2` spline and
+  `constrainAngle` match to 1e-3). State is a plain `Vec<Fish>`: the game
+  drives one from the mouse, the perf harness (`<count> fish`) drives many
+  from wander targets, and a future school can drive each via
+  `Fish::set_target(target, dir)` — the original `school.lua`'s contract.
+- `render.rs` — per-frame vector geometry in the original's painter order
+  (food, lateral fins, tail, body, dorsal, eyes), each part splined with
+  the original's Hermite "v2" algorithm (NOT Catmull-Rom), 0.5px-deduped,
+  filled by ear clipping (`love.math.triangulate`) and outlined like
+  LÖVE's "smooth" 1px line (solid core + 1px feather). The tail outline is
+  intentionally open (hidden under the body) and the body outline closes
+  at the nose, exactly like the Lua.
+
+Perf shape (the scaling loop's findings, M4 Pro, headless): geometry
+generation is the cost — per fish ~3.2µs single-threaded after the loop's
+optimizations (spline sampling capped at ~1.1/px of chord, sub-pixel
+polyline simplification with a bounded merge window, reflex-aware O(n)
+ear clipping, pooled scratch buffers, fish-parallel build + parallel
+concatenation on the compute pool). Triangles reach the GPU through a
+custom 12-byte vertex (pos f32x2 + unorm color) and persistent
+`RawBufferVec`s — the `Assets<Mesh>` path re-interleaved and re-copied
+the full mesh every frame and dominated past ~2k fish. Certified: ~4096
+fish ≥ ~100 fps (≈150 in clean windows; `pin` pile-up is *faster* — the
+FABRIK early-out freezes arrived fish). 8192 reads ~76–93: the floor is
+per-fish CPU geometry plus ~78MB/frame of vertex traffic; the identified
+next lever is GPU-side geometry generation from uploaded spines
+(~1MB/frame), an investment of the same shape as the flock's compute sim.
 
 ## Boids are plain data, not entities
 

@@ -3,6 +3,8 @@
 
 use bevy::prelude::*;
 
+use crate::ui::SliderBinding;
+
 /// Per-frame steering clamp (at the 60 fps reference, see [`REF_FPS`]).
 pub const MAX_FORCE: f32 = 0.3;
 /// Radius within which boids actively avoid each other.
@@ -59,8 +61,12 @@ impl Param {
         Self::Alignment,
         Self::Cohesion,
     ];
+}
 
-    pub fn label(self) -> &'static str {
+impl SliderBinding for Param {
+    type Settings = SimSettings;
+
+    fn label(self) -> &'static str {
         match self {
             Self::Count => "Boids",
             Self::Speed => "Speed",
@@ -70,7 +76,7 @@ impl Param {
         }
     }
 
-    pub fn range(self) -> (f32, f32) {
+    fn range(self) -> (f32, f32) {
         match self {
             // Raised round by round as optimizations landed (M4 Pro,
             // release): ~100+ fps holds to ~640k (GPU compute sim + the
@@ -87,7 +93,7 @@ impl Param {
         }
     }
 
-    pub fn get(self, s: &SimSettings) -> f32 {
+    fn get(self, s: &SimSettings) -> f32 {
         match self {
             Self::Count => s.count,
             Self::Speed => s.speed,
@@ -97,7 +103,7 @@ impl Param {
         }
     }
 
-    pub fn set(self, s: &mut SimSettings, value: f32) {
+    fn set(self, s: &mut SimSettings, value: f32) {
         let (min, max) = self.range();
         let value = value.clamp(min, max);
         match self {
@@ -110,7 +116,7 @@ impl Param {
     }
 
     /// Display format, matching the original's `%d` / `%.2f` specs.
-    pub fn format(self, value: f32) -> String {
+    fn format(self, value: f32) -> String {
         match self {
             Self::Count | Self::Speed => format!("{}", value.round() as i32),
             _ => format!("{value:.2}"),
@@ -120,7 +126,7 @@ impl Param {
     /// Normalized 0..1 slider position for the current value. Count uses a
     /// log scale so the whole 10..10000 range stays draggable with useful
     /// precision at the low end.
-    pub fn t(self, s: &SimSettings) -> f32 {
+    fn t(self, s: &SimSettings) -> f32 {
         let (min, max) = self.range();
         let value = self.get(s).clamp(min, max);
         match self {
@@ -130,7 +136,7 @@ impl Param {
     }
 
     /// Inverse of [`Self::t`]: the value for a 0..1 slider position.
-    pub fn value_from_t(self, t: f32) -> f32 {
+    fn value_from_t(self, t: f32) -> f32 {
         let (min, max) = self.range();
         let t = t.clamp(0.0, 1.0);
         match self {

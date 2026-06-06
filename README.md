@@ -124,13 +124,16 @@ That's where the optimize-without-changing-behaviour loop stops.
 ### Perf harness
 
 ```sh
-cargo run --release -- <count> [pin] [headless] [cpu] [nosim] [geo]
+cargo run --release -- <count> [fish] [pin] [headless] [cpu] [nosim] [geo]
 ```
 
 Prints fps once a second (vsync off). Any CLI argument skips the menu and
 boots straight into the experiment, so harness numbers stay comparable
 across versions. Flags compose:
 
+- `fish` — perf-test the fish experiment instead of the flock: `<count>`
+  fish chase per-fish wander targets (`pin`: all pile onto the centre).
+  Certified ~4096 at ≥~100 fps on the M4 Pro; see ARCHITECTURE.md.
 - `pin` — fake mouse attractor at screen centre (sustained worst case).
 - `headless` — no window: renders to an offscreen texture, schedule
   free-runs, and a snapshot lands in `/tmp/boids_headless_{0,1,2}.png`

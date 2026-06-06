@@ -1,52 +1,35 @@
-//! Native Bevy UI: HUD, the top-right live-tuning panel, and the [Esc]
-//! options popup. Recreates the SUIT-based UI of the original — same
-//! tunables, same theme colors — with retained-mode widgets. Sliders are
-//! hand-rolled: `Interaction::Pressed` persists while the mouse is held, so
-//! dragging is just "while pressed, map cursor x onto the track".
+//! The flock's own UI content: the top-right live-tuning panel (the
+//! original flock declares `onscreenControls`), its options-popup content
+//! (the same five sliders), and its score line. The chrome itself — HUD,
+//! popup shell, nav buttons, slider mechanics — is shared (src/ui.rs).
 
-use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
-use bevy::ui::{FocusPolicy, UiGlobalTransform};
-use bevy::window::PrimaryWindow;
 
 use super::settings::{Param, SimSettings};
 use super::sim::Flock;
-use crate::app::{AppState, RestartRequested, VsyncEnabled};
+use crate::app::{AppState, VsyncEnabled};
+use crate::experiments::{CurrentExperiment, ExperimentId, experiment_active};
 use crate::ui::{
-    COLOR_ACTIVE, COLOR_FILL, COLOR_NORMAL, COLOR_PANEL, COLOR_TEXT_DIM, ChildSpawner,
-    spawn_button, spawn_vsync_checkbox,
+    COLOR_NORMAL, COLOR_PANEL, ChildSpawner, HudScore, NavAction, slider_plugin,
+    spawn_options_popup, spawn_slider,
 };
 
 pub fn plugin(app: &mut App) {
-    app.add_plugins(FrameTimeDiagnosticsPlugin::default())
-        .insert_resource(PanelOpen(true))
-        .add_systems(Startup, spawn_hud)
-        .add_systems(OnEnter(AppState::Options), spawn_options_popup)
-        .add_systems(OnExit(AppState::Options), despawn_options_popup)
+    slider_plugin::<Param>(app);
+    app.insert_resource(PanelOpen(true))
+        .add_systems(Startup, spawn_panel)
+        .add_systems(
+            OnEnter(AppState::Options),
+            spawn_popup.run_if(experiment_active(ExperimentId::Flock)),
+        )
         .add_systems(
             Update,
             (
-                keyboard_input,
-                button_actions,
-                drag_sliders,
-                slider_feedback,
-                sync_slider_visuals,
-                sync_chrome_visibility,
-                update_hud,
+                sync_panel_visibility,
+                (button_actions, update_score).run_if(experiment_active(ExperimentId::Flock)),
             ),
         );
 }
-
-#[derive(Component)]
-struct HudScore;
-
-#[derive(Component)]
-struct HudFps;
-
-/// Everything the HUD shows during play (score, fps, the hint line) — hidden
-/// on the menu, where the flock is only a backdrop.
-#[derive(Component)]
-struct HudItem;
 
 /// The top-right on-screen controls panel.
 #[derive(Component)]
@@ -60,79 +43,16 @@ struct PanelBody;
 #[derive(Component)]
 struct PanelToggleLabel;
 
-#[derive(Component)]
-struct OptionsPopup;
-
-/// Draggable slider bar; carries a [`Param`] binding alongside.
-#[derive(Component)]
-struct SliderTrack;
-
-/// Filled portion of a slider.
-#[derive(Component)]
-struct SliderFill;
-
-/// Text showing a parameter's current value.
-#[derive(Component)]
-struct ValueLabel;
-
+/// The panel's Hide/Show toggle button.
 #[derive(Component, Clone, Copy)]
-enum ButtonAction {
-    TogglePanel,
-    ResetSettings,
-    Resume,
-    Restart,
-    MainMenu,
-}
+struct TogglePanel;
 
 /// Whether the on-screen panel is expanded ("Hide"/"Show" in the original).
 #[derive(Resource)]
 struct PanelOpen(bool);
 
-// ---------------------------------------------------------------------------
-// Spawning
-
-fn spawn_hud(mut commands: Commands, settings: Res<SimSettings>) {
-    // Score, top-left — like the original's HUD.
-    commands.spawn((
-        HudItem,
-        HudScore,
-        Text::new("Boids: 0"),
-        TextFont::from_font_size(18.0),
-        TextColor(Color::WHITE),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
-            left: Val::Px(12.0),
-            ..default()
-        },
-    ));
-    commands.spawn((
-        HudItem,
-        HudFps,
-        Text::new("-- fps"),
-        TextFont::from_font_size(12.0),
-        TextColor(COLOR_TEXT_DIM),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(34.0),
-            left: Val::Px(12.0),
-            ..default()
-        },
-    ));
-    commands.spawn((
-        HudItem,
-        Text::new("[R] Restart   [Esc] Options"),
-        TextFont::from_font_size(14.0),
-        TextColor(COLOR_TEXT_DIM),
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(8.0),
-            left: Val::Px(12.0),
-            ..default()
-        },
-    ));
-
-    // On-screen controls, top-right: Hide/Show toggle + the five sliders.
+/// On-screen controls, top-right: Hide/Show toggle + the five sliders.
+fn spawn_panel(mut commands: Commands, settings: Res<SimSettings>) {
     commands
         .spawn((
             PanelRoot,
@@ -155,7 +75,7 @@ fn spawn_hud(mut commands: Commands, settings: Res<SimSettings>) {
             panel
                 .spawn((
                     Button,
-                    ButtonAction::TogglePanel,
+                    TogglePanel,
                     Node {
                         width: Val::Px(52.0),
                         height: Val::Px(20.0),
@@ -187,285 +107,62 @@ fn spawn_hud(mut commands: Commands, settings: Res<SimSettings>) {
                 ))
                 .with_children(|body| {
                     for param in Param::ALL {
-                        spawn_slider(body, param, &settings, 12.0);
+                        spawn_slider(body, (), param, &settings, 12.0);
                     }
                 });
         });
 }
 
-/// Label + value readout above a draggable bar, one per tunable.
-fn spawn_slider(parent: &mut ChildSpawner, param: Param, settings: &SimSettings, font_size: f32) {
-    parent
-        .spawn(Node {
-            flex_direction: FlexDirection::Column,
-            width: Val::Percent(100.0),
-            row_gap: Val::Px(2.0),
-            ..default()
-        })
-        .with_children(|slider| {
-            slider
-                .spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::SpaceBetween,
-                    width: Val::Percent(100.0),
-                    ..default()
-                })
-                .with_children(|labels| {
-                    labels.spawn((
-                        Text::new(param.label()),
-                        TextFont::from_font_size(font_size),
-                        TextColor(Color::WHITE),
-                    ));
-                    labels.spawn((
-                        ValueLabel,
-                        param,
-                        Text::new(param.format(param.get(settings))),
-                        TextFont::from_font_size(font_size),
-                        TextColor(COLOR_TEXT_DIM),
-                    ));
-                });
-            slider
-                .spawn((
-                    SliderTrack,
-                    param,
-                    Interaction::default(),
-                    FocusPolicy::Block,
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Px(14.0),
-                        border_radius: BorderRadius::all(Val::Px(4.0)),
-                        ..default()
-                    },
-                    BackgroundColor(COLOR_NORMAL),
-                ))
-                .with_children(|track| {
-                    track.spawn((
-                        SliderFill,
-                        param,
-                        Node {
-                            width: Val::Percent(param.t(settings) * 100.0),
-                            height: Val::Percent(100.0),
-                            border_radius: BorderRadius::all(Val::Px(4.0)),
-                            ..default()
-                        },
-                        BackgroundColor(COLOR_FILL),
-                    ));
-                });
-        });
-}
-
-/// One of the popup's nav buttons (28 px high, like the original's row).
-fn nav_button(parent: &mut ChildSpawner, action: ButtonAction, label: &str, width: f32) {
-    spawn_button(parent, action, label, Vec2::new(width, 28.0), 14.0);
-}
-
-/// The paused options popup: instructions, the same five sliders, nav buttons.
-fn spawn_options_popup(
-    mut commands: Commands,
-    settings: Res<SimSettings>,
-    vsync: Res<VsyncEnabled>,
-) {
-    commands
-        .spawn((
-            OptionsPopup,
-            Interaction::default(),
-            FocusPolicy::Block,
-            GlobalZIndex(10),
-            Node {
-                position_type: PositionType::Absolute,
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            // Dim the scene behind, like the original popup.
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.45)),
-        ))
-        .with_children(|overlay| {
-            overlay
-                .spawn((
-                    Node {
-                        flex_direction: FlexDirection::Column,
-                        align_items: AlignItems::Center,
-                        row_gap: Val::Px(10.0),
-                        padding: UiRect::all(Val::Px(20.0)),
-                        width: Val::Px(480.0),
-                        border_radius: BorderRadius::all(Val::Px(6.0)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.10, 0.10, 0.12, 0.95)),
-                ))
-                .with_children(|popup| {
-                    popup.spawn((
-                        Text::new("Options"),
-                        TextFont::from_font_size(24.0),
-                        TextColor(Color::WHITE),
-                    ));
-                    for line in [
-                        // Plain hyphen: Bevy's default font has no em-dash glyph.
-                        "Move your mouse - the flock follows from afar and scatters up close.",
-                        "Tune separation / alignment / cohesion below.",
-                    ] {
-                        popup.spawn((
-                            Text::new(line),
-                            TextFont::from_font_size(13.0),
-                            TextColor(COLOR_TEXT_DIM),
-                        ));
-                    }
-                    popup
-                        .spawn(Node {
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(6.0),
-                            width: Val::Percent(100.0),
-                            margin: UiRect::vertical(Val::Px(6.0)),
-                            ..default()
-                        })
-                        .with_children(|body| {
-                            for param in Param::ALL {
-                                spawn_slider(body, param, &settings, 14.0);
-                            }
-                            spawn_vsync_checkbox(body, &vsync, 14.0);
-                        });
-                    popup
-                        .spawn(Node {
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(8.0),
-                            ..default()
-                        })
-                        .with_children(|nav| {
-                            nav_button(nav, ButtonAction::ResetSettings, "Reset settings", 120.0);
-                            nav_button(nav, ButtonAction::Resume, "Resume", 80.0);
-                            nav_button(nav, ButtonAction::Restart, "Restart", 80.0);
-                            nav_button(nav, ButtonAction::MainMenu, "Main Menu", 100.0);
-                        });
-                });
-        });
-}
-
-fn despawn_options_popup(mut commands: Commands, popups: Query<Entity, With<OptionsPopup>>) {
-    for entity in &popups {
-        commands.entity(entity).despawn();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Interaction
-
-/// [Esc] / [O] toggles the options popup, pausing the simulation.
-fn keyboard_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    state: Res<State<AppState>>,
-    mut next: ResMut<NextState<AppState>>,
-) {
-    if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::KeyO) {
-        match state.get() {
-            AppState::Playing => next.set(AppState::Options),
-            AppState::Options => next.set(AppState::Playing),
-            // The menu handles its own keys (Esc quits there).
-            AppState::Menu => {}
-        }
-    }
+/// The flock's options-popup content: instructions + the five sliders.
+fn spawn_popup(mut commands: Commands, settings: Res<SimSettings>, vsync: Res<VsyncEnabled>) {
+    spawn_options_popup(
+        &mut commands,
+        &vsync,
+        &[
+            // Plain hyphen: Bevy's default font has no em-dash glyph.
+            "Move your mouse - the flock follows from afar and scatters up close.",
+            "Tune separation / alignment / cohesion below.",
+        ],
+        |body: &mut ChildSpawner| {
+            for param in Param::ALL {
+                spawn_slider(body, (), param, &settings, 14.0);
+            }
+        },
+    );
 }
 
 fn button_actions(
-    buttons: Query<(&Interaction, &ButtonAction), Changed<Interaction>>,
+    toggles: Query<&Interaction, (Changed<Interaction>, With<TogglePanel>)>,
+    nav: Query<(&Interaction, &NavAction), Changed<Interaction>>,
     mut settings: ResMut<SimSettings>,
     mut panel_open: ResMut<PanelOpen>,
-    mut restart: ResMut<RestartRequested>,
-    mut next: ResMut<NextState<AppState>>,
 ) {
-    for (interaction, action) in &buttons {
-        if *interaction != Interaction::Pressed {
-            continue;
+    for interaction in &toggles {
+        if *interaction == Interaction::Pressed {
+            panel_open.0 = !panel_open.0;
         }
-        match action {
-            ButtonAction::TogglePanel => panel_open.0 = !panel_open.0,
-            ButtonAction::ResetSettings => *settings = SimSettings::default(),
-            ButtonAction::Resume => next.set(AppState::Playing),
-            ButtonAction::Restart => {
-                restart.0 = true;
-                next.set(AppState::Playing);
-            }
-            ButtonAction::MainMenu => next.set(AppState::Menu),
+    }
+    // The shared popup's "Reset settings": each experiment restores its own
+    // defaults while it is the current one (this system is gated on that).
+    for (interaction, action) in &nav {
+        if *interaction == Interaction::Pressed && matches!(action, NavAction::ResetSettings) {
+            *settings = SimSettings::default();
         }
     }
 }
 
-/// While a track is held (`Pressed` persists during a drag, even off-node),
-/// map the cursor's x onto the track to set the bound parameter.
-fn drag_sliders(
-    window: Query<&Window, With<PrimaryWindow>>,
-    tracks: Query<(&Interaction, &Param, &ComputedNode, &UiGlobalTransform), With<SliderTrack>>,
-    mut settings: ResMut<SimSettings>,
-) {
-    let Ok(window) = window.single() else { return };
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    for (interaction, param, node, transform) in &tracks {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        // ComputedNode is in physical pixels; the cursor is logical.
-        let scale = node.inverse_scale_factor();
-        let center_x = transform.translation.x * scale;
-        let width = node.size().x * scale;
-        if width <= 0.0 {
-            continue;
-        }
-        let t = ((cursor.x - (center_x - width / 2.0)) / width).clamp(0.0, 1.0);
-        param.set(&mut settings, param.value_from_t(t));
-    }
-}
-
-/// Highlight a slider's fill while it is being dragged.
-fn slider_feedback(
-    tracks: Query<(&Interaction, &Children), (Changed<Interaction>, With<SliderTrack>)>,
-    mut fills: Query<&mut BackgroundColor, With<SliderFill>>,
-) {
-    for (interaction, children) in &tracks {
-        for child in children.iter() {
-            if let Ok(mut background) = fills.get_mut(child) {
-                background.0 = match interaction {
-                    Interaction::Pressed => COLOR_ACTIVE,
-                    _ => COLOR_FILL,
-                };
-            }
-        }
-    }
-}
-
-/// Keep every bound widget (fill width, value text) in sync with the
-/// settings, wherever the change came from (panel, popup, or reset).
-fn sync_slider_visuals(
-    settings: Res<SimSettings>,
-    mut fills: Query<(&Param, &mut Node), With<SliderFill>>,
-    mut labels: Query<(&Param, &mut Text), With<ValueLabel>>,
-) {
-    if !settings.is_changed() {
-        return;
-    }
-    for (param, mut node) in &mut fills {
-        node.width = Val::Percent(param.t(&settings) * 100.0);
-    }
-    for (param, mut text) in &mut labels {
-        text.0 = param.format(param.get(&settings));
-    }
-}
-
-/// Collapse/expand the panel body, hide the whole panel while paused (the
-/// original only draws the on-screen controls during play), and hide the
-/// HUD on the menu, where the flock is only a backdrop.
-fn sync_chrome_visibility(
+/// Collapse/expand the panel body, and show the whole panel only while the
+/// flock is actually being played (the original only draws the on-screen
+/// controls during play; other experiments have no panel at all).
+fn sync_panel_visibility(
     panel_open: Res<PanelOpen>,
     state: Res<State<AppState>>,
+    current: Res<CurrentExperiment>,
     mut bodies: Query<&mut Node, With<PanelBody>>,
     mut toggle_labels: Query<&mut Text, With<PanelToggleLabel>>,
-    mut roots: Query<&mut Visibility, (With<PanelRoot>, Without<HudItem>)>,
-    mut hud_items: Query<&mut Visibility, With<HudItem>>,
+    mut roots: Query<&mut Visibility, With<PanelRoot>>,
 ) {
-    if !panel_open.is_changed() && !state.is_changed() {
+    if !panel_open.is_changed() && !state.is_changed() && !current.is_changed() {
         return;
     }
     for mut node in &mut bodies {
@@ -478,28 +175,20 @@ fn sync_chrome_visibility(
     for mut text in &mut toggle_labels {
         text.0 = if panel_open.0 { "Hide" } else { "Show" }.into();
     }
+    let shown = *state.get() == AppState::Playing && current.0 == ExperimentId::Flock;
     for mut visibility in &mut roots {
-        *visibility = if *state.get() == AppState::Playing {
+        *visibility = if shown {
             Visibility::Inherited
         } else {
             Visibility::Hidden
-        };
-    }
-    for mut visibility in &mut hud_items {
-        *visibility = if *state.get() == AppState::Menu {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
         };
     }
 }
 
-fn update_hud(
+fn update_score(
     flock: Res<Flock>,
     gpu_count: Option<Res<super::gpu_sim::GpuFlockCount>>,
-    diagnostics: Res<DiagnosticsStore>,
-    mut score: Query<&mut Text, (With<HudScore>, Without<HudFps>)>,
-    mut fps: Query<&mut Text, With<HudFps>>,
+    mut score: Query<&mut Text, With<HudScore>>,
 ) {
     // GPU sim mode keeps a CPU-side count mirror; the CPU sim owns `Flock`.
     let count = gpu_count.map_or(flock.0.len(), |gpu| gpu.0);
@@ -507,17 +196,6 @@ fn update_hud(
     for mut text in &mut score {
         if text.0 != label {
             text.0.clone_from(&label);
-        }
-    }
-    if let Some(value) = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FPS)
-        .and_then(|fps| fps.smoothed())
-    {
-        let label = format!("{value:.0} fps");
-        for mut text in &mut fps {
-            if text.0 != label {
-                text.0.clone_from(&label);
-            }
         }
     }
 }
