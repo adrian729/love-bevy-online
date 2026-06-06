@@ -26,34 +26,34 @@
 
 use std::f32::consts::TAU;
 
+use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::core_2d::{CORE_2D_DEPTH_FORMAT, Transparent2d};
 use bevy::ecs::query::ROQueryItem;
 use bevy::ecs::system::SystemParamItem;
 use bevy::ecs::system::lifetimeless::SRes;
+use bevy::image::ImageSampler;
 use bevy::math::FloatOrd;
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
+use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_phase::{
     AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand,
     RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
 };
-use bevy::asset::RenderAssetUsages;
-use bevy::image::ImageSampler;
-use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::binding_types::{sampler, texture_2d};
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BufferUsages,
     ColorTargetState, ColorWrites, CompareFunction, DepthBiasState, DepthStencilState, Extent3d,
-    FragmentState, IndexFormat, MultisampleState, PipelineCache, PrimitiveState,
-    PrimitiveTopology, RawBufferVec, RenderPipelineDescriptor, SamplerBindingType, ShaderStages,
+    FragmentState, IndexFormat, MultisampleState, PipelineCache, PrimitiveState, PrimitiveTopology,
+    RawBufferVec, RenderPipelineDescriptor, SamplerBindingType, ShaderStages,
     SpecializedRenderPipeline, SpecializedRenderPipelines, StencilFaceState, StencilState,
-    TextureDimension, TextureFormat, TextureSampleType, VertexAttribute, VertexFormat,
-    VertexState, VertexStepMode,
+    TextureDimension, TextureFormat, TextureSampleType, VertexAttribute, VertexFormat, VertexState,
+    VertexStepMode,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use bevy::render::texture::GpuImage;
 use bevy::render::sync_world::MainEntity;
+use bevy::render::texture::GpuImage;
 use bevy::render::view::{ExtractedView, ViewTarget};
 use bevy::render::{Extract, Render, RenderApp, RenderStartup, RenderSystems};
 use bevy::sprite_render::{
@@ -61,7 +61,7 @@ use bevy::sprite_render::{
 };
 use bytemuck::{Pod, Zeroable};
 
-use crate::gpu_sim::{FlockGpuBuffers, GpuFlockParams};
+use super::gpu_sim::{FlockGpuBuffers, GpuFlockParams};
 
 /// Which simulation feeds the instanced draw. With `Gpu`, vertex slot 1 is
 /// the compute sim's instance buffer and no per-boid data touches the CPU;
@@ -178,8 +178,10 @@ fn boid_texture_image() -> Image {
         Vec2::new(0.0, 5.0),
         Vec2::new(0.0, -5.0),
     ];
-    let inside =
-        |poly: &[Vec2], p: Vec2| poly.windows(2).all(|e| (e[1] - e[0]).perp_dot(p - e[0]) >= 0.0);
+    let inside = |poly: &[Vec2], p: Vec2| {
+        poly.windows(2)
+            .all(|e| (e[1] - e[0]).perp_dot(p - e[0]) >= 0.0)
+    };
 
     let (width, height) = (QUAD_SIZE.x as usize, QUAD_SIZE.y as usize);
     let mut data = Vec::with_capacity(width * height * 4);
@@ -205,7 +207,8 @@ fn boid_texture_image() -> Image {
             // Premultiplied linear color: red (1,0,0) and white (1,1,1) both
             // have r = 1, so r = coverage; g = b = the white share.
             let alpha = covered as f32 / 64.0;
-            let srgba: Srgba = LinearRgba::rgb(alpha, white as f32 / 64.0, white as f32 / 64.0).into();
+            let srgba: Srgba =
+                LinearRgba::rgb(alpha, white as f32 / 64.0, white as f32 / 64.0).into();
             data.extend([
                 (srgba.red * 255.0).round() as u8,
                 (srgba.green * 255.0).round() as u8,
@@ -501,7 +504,11 @@ impl<P: PhaseItem> RenderCommand<P> for DrawFlockInstanced {
         _: &P,
         _: ROQueryItem<'w, '_, Self::ViewQuery>,
         _: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
-        (buffers, mode, style, gpu, gpu_params, quad_bind_group): SystemParamItem<'w, '_, Self::Param>,
+        (buffers, mode, style, gpu, gpu_params, quad_bind_group): SystemParamItem<
+            'w,
+            '_,
+            Self::Param,
+        >,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         let buffers = buffers.into_inner();
@@ -553,7 +560,11 @@ impl<P: PhaseItem> RenderCommand<P> for DrawFlockInstanced {
     }
 }
 
-type DrawFlock = (SetItemPipeline, SetMesh2dViewBindGroup<0>, DrawFlockInstanced);
+type DrawFlock = (
+    SetItemPipeline,
+    SetMesh2dViewBindGroup<0>,
+    DrawFlockInstanced,
+);
 
 /// Queue the one flock draw into every 2D view.
 #[allow(clippy::too_many_arguments)]

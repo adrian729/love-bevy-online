@@ -1,4 +1,4 @@
-//! GPU-compute flock simulation: the same Reynolds rules as `boids.rs`,
+//! GPU-compute flock simulation: the same Reynolds rules as `sim.rs`,
 //! ported to WGSL and run entirely on the GPU. Per frame, one compute pass
 //! with five dispatches:
 //!
@@ -15,7 +15,7 @@
 //! CPU's only per-frame work is a uniform update; on grow/restart it uploads
 //! the new boids' states. The render instances never leave the GPU.
 //!
-//! The CPU simulation in `boids.rs` remains available behind the `cpu`
+//! The CPU simulation in `sim.rs` remains available behind the `cpu`
 //! perf-flag, and is the reference for behaviour parity: the WGSL mirrors
 //! its math constant-for-constant, including the `MAX_NEIGHBOUR_SAMPLES`
 //! circular-window sampling.
@@ -39,9 +39,8 @@ use bevy::shader::PipelineCacheError;
 use bevy::window::PrimaryWindow;
 use rand::Rng;
 
-use crate::AppState;
-use crate::boids::{PinnedAttractor, PointerOverUi, RestartRequested, SimBounds};
-use crate::settings::{NEIGHBOUR_DIST, SimSettings};
+use super::settings::{NEIGHBOUR_DIST, SimSettings};
+use crate::app::{AppState, PinnedAttractor, PointerOverUi, RestartRequested, SimBounds};
 
 /// Buffer capacity in boids — two more doublings of headroom past the
 /// current slider maximum. ~150 MB of GPU memory all-in at this size.
@@ -117,14 +116,17 @@ fn gpu_sync_flock(
     spawns.upload.clear();
     spawns.base = count.0 as u32;
 
+    // The sim also steps behind the menu (the live backdrop); the R key
+    // only restarts during actual play.
     let playing = *state.get() == AppState::Playing;
-    if (restart.0 || keys.just_pressed(KeyCode::KeyR)) && playing {
+    let active = state.get().sim_runs();
+    if (restart.0 && active) || (keys.just_pressed(KeyCode::KeyR) && playing) {
         restart.0 = false;
         count.0 = 0;
         spawns.base = 0;
     }
 
-    if playing {
+    if active {
         let target = (settings.count.round().max(1.0) as usize).min(MAX_BOIDS);
         if count.0 < target {
             let half = bounds.0 / 2.0;
@@ -146,7 +148,10 @@ fn gpu_sync_flock(
     }
 
     let size = bounds.0.max(Vec2::ONE);
-    let mouse = if pinned.0 {
+    // No mouse force behind the menu — the original's `menuBg:update(dt, true)`.
+    let mouse = if *state.get() == AppState::Menu {
+        None
+    } else if pinned.0 {
         Some(Vec2::ZERO)
     } else if pointer_over_ui.0 {
         None
@@ -175,7 +180,7 @@ fn gpu_sync_flock(
         cols: (size.x / NEIGHBOUR_DIST).ceil().max(1.0) as u32,
         rows: (size.y / NEIGHBOUR_DIST).ceil().max(1.0) as u32,
     };
-    run.0 = playing && count.0 > 0;
+    run.0 = active && count.0 > 0;
 }
 
 /// The GPU-side buffers. `instances_rev` doubles as the renderer's vertex
@@ -401,12 +406,13 @@ impl render_graph::Node for FlockSimNode {
         // guaranteed everywhere — and a multiple of every vendor's SIMD
         // width (32/64), so no lane sits idle on any GPU.
         let boid_groups = params.count.div_ceil(256);
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor {
-                label: Some("flock_sim"),
-                ..default()
-            });
+        let mut pass =
+            render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("flock_sim"),
+                    ..default()
+                });
         pass.set_bind_group(0, bind_group, &[]);
         // Sequential dispatches in one pass: WebGPU guarantees the writes of
         // each dispatch are visible to the next.
@@ -450,7 +456,7 @@ impl Plugin for FlockGpuSimPlugin {
                 ExtractResourcePlugin::<GpuSpawns>::default(),
                 ExtractResourcePlugin::<GpuSimRun>::default(),
             ))
-            .add_systems(Update, gpu_sync_flock.after(crate::boids::update_sim_bounds));
+            .add_systems(Update, gpu_sync_flock.after(crate::app::update_sim_bounds));
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -464,7 +470,7 @@ impl Plugin for FlockGpuSimPlugin {
 }
 
 const SIM_SHADER: &str = r"
-// Constants mirrored from src/settings.rs — keep in sync.
+// Constants mirrored from src/experiments/flock/settings.rs — keep in sync.
 const NEIGHBOUR_DIST: f32 = 100.0;
 const NEIGHBOUR_D2: f32 = 10000.0;
 const SEPARATE_D2: f32 = 2500.0;
@@ -473,7 +479,7 @@ const REF_FPS: f32 = 60.0;
 const MOUSE_NEAR2: f32 = 10000.0;
 const MOUSE_ATTRACT_K: f32 = 4.0;
 const MOUSE_REPEL_K: f32 = -6.0;
-// Mirrors MAX_NEIGHBOUR_SAMPLES in src/boids.rs.
+// Mirrors MAX_NEIGHBOUR_SAMPLES in src/experiments/flock/sim.rs.
 const MAX_SAMPLES: u32 = 128u;
 
 struct Params {

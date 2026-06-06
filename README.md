@@ -1,8 +1,10 @@
-# Flock — Reynolds boids in Bevy/Rust
+# love-bevy-online — the LÖVE experiments in Bevy/Rust
 
-A Bevy port of the **flock** experiment from the LÖVE/Lua `love-online`
-project. Same simulation rules, same tunables, same UI behaviour — rebuilt
-on Bevy to see how far the same experiment can be pushed in Rust.
+A Bevy port of the LÖVE/Lua `love-online` project: a start menu with the
+live experiment animating behind it, and — so far — one experiment,
+**flock** (Reynolds boids). Same simulation rules, same tunables, same UI
+behaviour — rebuilt on Bevy to see how far the same experiment can be
+pushed in Rust.
 
 Answer so far: **the LÖVE original capped at 300 boids; this port holds
 ~100+ fps at 640,000**, with the slider allowing 1.28 million.
@@ -12,12 +14,17 @@ cargo run            # dev profile: fast iteration (dynamic linking, opt-level 1
 cargo run --release  # optimized build
 ```
 
+A normal launch starts on the menu, with the flock running ambiently
+(mouse ignored) behind a dim overlay — like the original's animated menu
+backdrop. Click an experiment to play it.
+
 ## Controls
 
 | Input | Action |
 |---|---|
+| Menu: click an experiment | Start it fresh (`Esc` on the menu quits) |
 | Mouse | Attracts the flock from afar, scatters it within 100 px |
-| `Esc` / `O` | Pause + options popup (instructions, sliders, Reset/Resume/Restart) |
+| `Esc` / `O` | Pause + options popup (instructions, sliders, VSync checkbox, Reset/Resume/Restart/Main Menu) |
 | `R` | Restart (respawn the flock, keep settings) |
 | Top-right panel | Live tuning while playing; `Hide`/`Show` collapses it |
 
@@ -38,23 +45,33 @@ All apply live, including the boid count (the flock grows/shrinks on the fly).
 (Design rationale — what each piece is and why it exists — lives in
 [ARCHITECTURE.md](ARCHITECTURE.md).)
 
-Two simulations share one renderer; both implement exactly the same rules
-(`target_force = k * limit(normalize(dir) * max_speed - vel, 0.3)`, converted
-from the original's per-frame units to px/s² so physics are frame-rate
-independent).
+The crate is laid out for more experiments to land beside the flock,
+mirroring the original's `minigames/` registry:
 
-- **GPU compute sim** (default, `src/gpu_sim.rs`) — six WGSL dispatches per
-  frame: clear grid → atomic histogram → prefix scan → scatter into
-  cell-major order → steer + integrate → reverse-copy the render instances.
-  State lives in storage buffers; the CPU only updates a uniform (and
-  uploads spawns) — per-boid data never crosses the bus.
-- **CPU sim** (`cargo run --release -- <count> cpu`, `src/boids.rs`) — the
-  reference implementation: parallel counting sort into SoA arrays, then a
-  branchless, hand-SIMD (NEON `Vec4`) steering kernel on the compute task
-  pool. Kept because it's the behavioural baseline the GPU port is checked
-  against, and it's an instructive artifact on its own (~320k boids at
-  ~125 fps).
-- **Renderer** (`src/render.rs`) — the whole flock is *one* instanced draw
+- `src/app.rs` — the shared shell: the `Menu`/`Playing`/`Options` state
+  machine, the camera, the simulation bounds, the perf-harness plumbing.
+- `src/menu.rs` — the start menu; `src/ui.rs` — the shared SUIT theme and
+  widgets.
+- `src/experiments/` — the registry (`EXPERIMENTS`) the menu lists; each
+  experiment is a folder of plugins under it (`src/experiments/flock/`).
+
+Within the flock, two simulations share one renderer; both implement exactly
+the same rules (`target_force = k * limit(normalize(dir) * max_speed - vel,
+0.3)`, converted from the original's per-frame units to px/s² so physics are
+frame-rate independent).
+
+- **GPU compute sim** (default, `src/experiments/flock/gpu_sim.rs`) — six
+  WGSL dispatches per frame: clear grid → atomic histogram → prefix scan →
+  scatter into cell-major order → steer + integrate → reverse-copy the
+  render instances. State lives in storage buffers; the CPU only updates a
+  uniform (and uploads spawns) — per-boid data never crosses the bus.
+- **CPU sim** (`cargo run --release -- <count> cpu`,
+  `src/experiments/flock/sim.rs`) — the reference implementation: parallel
+  counting sort into SoA arrays, then a branchless, hand-SIMD (NEON `Vec4`)
+  steering kernel on the compute task pool. Kept because it's the
+  behavioural baseline the GPU port is checked against, and it's an
+  instructive artifact on its own (~320k boids at ~125 fps).
+- **Renderer** (`src/experiments/flock/render.rs`) — the whole flock is *one* instanced draw
   call into Bevy's `Transparent2d` phase. The boid shape (red dot + white
   triangle) is baked once, on the CPU, into a 20x12 coverage texture, and
   each boid is an alpha-tested quad: two triangles, six shader-generated
@@ -110,7 +127,9 @@ That's where the optimize-without-changing-behaviour loop stops.
 cargo run --release -- <count> [pin] [headless] [cpu] [nosim] [geo]
 ```
 
-Prints fps once a second (vsync off). Flags compose:
+Prints fps once a second (vsync off). Any CLI argument skips the menu and
+boots straight into the experiment, so harness numbers stay comparable
+across versions. Flags compose:
 
 - `pin` — fake mouse attractor at screen centre (sustained worst case).
 - `headless` — no window: renders to an offscreen texture, schedule
@@ -157,7 +176,8 @@ target-gated.
 | `Flock:setSize` truncating arrays | Same: grow appends random boids, shrink truncates (GPU) / removes uniformly (CPU) |
 | SUIT immediate-mode sliders/buttons | Hand-rolled retained `bevy_ui` sliders (`Interaction::Pressed` persists through a drag) |
 | `pointerOverUI` → `ignore_mouse` | `PointerOverUi` resource |
-| `state = 'playing' / 'options'` | `States` enum; sim gated on `Playing`, popup on `OnEnter(Options)` |
+| `state = 'menu' / 'playing' / 'options'` | `States` enum; sim steps in `Menu` (the live backdrop) and `Playing`, popup on `OnEnter(Options)` |
+| `minigames` registry + menu backdrop pool | `src/experiments/` registry; the flock is the only entry (and backdrop) so far |
 
 Steering constants kept from the original: `max_force 0.3`, separation radius
 50 px, neighbour radius 100 px, mouse attract `k = 4` / repel `k = -6` inside
@@ -165,9 +185,14 @@ Steering constants kept from the original: `max_force 0.3`, separation radius
 
 Deliberate differences:
 
-- No multi-game main menu — this port is only the flock experiment.
+- The menu lists one experiment so far (the original had five); a random
+  backdrop pool comes back once there is something to pick between.
 - An FPS readout under the score, to compare runtimes (the point of the
-  experiment).
+  experiment) — plus a VSync checkbox in the options popup, so a normal run
+  can uncap presentation without the perf harness. Heads-up when reading
+  the number with VSync on: it tracks the display's *current* refresh rate
+  (a MacBook on battery drops ProMotion to 60 Hz; perf flags disable vsync
+  entirely).
 - Physics are frame-rate independent (the original integrates per frame).
 - The Boids slider is log-scaled so the huge range stays draggable.
 - No antialiasing — same as LÖVE's default, and 4x MSAA is pure fill-rate

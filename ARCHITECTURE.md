@@ -6,6 +6,24 @@ design.)
 
 ## The shape of the thing
 
+The crate is an experiment collection, mirroring the original's `minigames/`
+registry. A thin shared shell wraps the experiments:
+
+- `src/app.rs` — the `Menu` / `Playing` / `Options` state machine, the
+  camera, `SimBounds`, and the perf-harness plumbing (headless render
+  target, pinned attractor). The simulation steps in `Menu` too: the menu's
+  live backdrop, the original's `menuBg` (with the mouse ignored, like
+  `menuBg:update(dt, true)`). Perf runs (any CLI args) boot straight into
+  `Playing`, so harness numbers never involve the menu.
+- `src/menu.rs` + `src/ui.rs` — the start menu, and the SUIT theme/widgets
+  shared between it and the experiments' own UI.
+- `src/experiments/mod.rs` — the registry the menu lists. Each experiment is
+  a folder of plugins under `src/experiments/`; plugins register once at
+  startup, so a second experiment will gate its systems on a
+  `CurrentExperiment` resource rather than being loaded on demand.
+
+The flock experiment itself (`src/experiments/flock/`):
+
 ```
               ┌─────────────────────────────┐
  settings.rs  │ SimSettings (live tunables) │
@@ -13,7 +31,7 @@ design.)
                          │
           ┌──────────────┴───────────────┐
           │                              │
-   gpu_sim.rs (default)           boids.rs (`cpu` flag)
+   gpu_sim.rs (default)           sim.rs (`cpu` flag)
    6 compute dispatches           counting sort + NEON kernel
    state never leaves GPU         on the compute task pool
           │                              │
@@ -115,7 +133,7 @@ spawned boids' states when the flock grows. Per-boid data never crosses the
 bus in either direction — the renderer binds the sim's instance buffer
 directly as its vertex buffer.
 
-## CPU sim (`boids.rs`) — the reference
+## CPU sim (`sim.rs`) — the reference
 
 Same algorithm, tuned for a many-core CPU:
 
@@ -241,7 +259,7 @@ Nothing in the architecture is Apple-specific; some tuning is.
 - **Self-tuning where it matters**: the CPU sim's task chunk sizes are
   derived from the compute pool's thread count at runtime (the tasks-per-
   worker *ratio* is the tuning; the absolute sizes adapt — see
-  `chunk_sizes` in `boids.rs`, pinned by a unit test to the values certified
+  `chunk_sizes` in `sim.rs`, pinned by a unit test to the values certified
   here). The GPU workgroup size (256) needs no adaptation: it's the WebGPU
   baseline limit and a multiple of every vendor's SIMD width — the portable
   optimum, not a machine-specific choice.

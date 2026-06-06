@@ -5,26 +5,25 @@
 //! The flock is plain data, not entities: [`Flock`] holds the state, the
 //! steering kernel runs over cell-sorted SoA arrays on the compute task
 //! pool, and each frame publishes `[x, y, angle]` records that
-//! [`crate::render`] uploads as one instanced draw. (One entity per boid
+//! [`super::render`] uploads as one instanced draw. (One entity per boid
 //! worked to ~40k; past that, per-entity engine bookkeeping — transform
 //! propagation, visibility, extraction — dominated the frame.)
 
 use std::f32::consts::TAU;
 
-use bevy::asset::RenderAssetUsages;
-use bevy::camera::RenderTarget;
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::tasks::ComputeTaskPool;
 use bevy::window::PrimaryWindow;
 use rand::Rng;
 
-use crate::AppState;
-use crate::render::{BoidInstance, FlockRenderData};
-use crate::settings::{
+use super::render::{BoidInstance, FlockRenderData};
+use super::settings::{
     MAX_FORCE, MOUSE_ATTRACT_K, MOUSE_NEAR, MOUSE_REPEL_K, NEIGHBOUR_DIST, REF_FPS, SEPARATE_DIST,
     SimSettings,
+};
+use crate::app::{
+    AppState, PinnedAttractor, PointerOverUi, RestartRequested, SimBounds, sim_active,
+    update_sim_bounds,
 };
 
 /// True when this run simulates on the CPU (the `cpu` or `nosim` perf
@@ -38,24 +37,19 @@ pub fn plugin(app: &mut App) {
     // skip steering, to measure the render floor in isolation.
     let nosim = std::env::args().any(|arg| arg == "nosim");
     let cpu = cpu_sim_selected();
-    app.init_resource::<PointerOverUi>()
-        .init_resource::<RestartRequested>()
-        .init_resource::<SimBounds>()
-        .init_resource::<Flock>()
-        .add_systems(Startup, setup)
-        .add_systems(Update, (update_sim_bounds, headless_snapshots))
-        .add_systems(
-            Update,
-            (
-                handle_restart,
-                sync_flock_size,
-                flocking.run_if(move || !nosim),
-            )
-                .chain()
-                .after(update_sim_bounds)
-                .run_if(move || cpu)
-                .run_if(in_state(AppState::Playing)),
-        );
+    app.init_resource::<Flock>().add_systems(
+        Update,
+        (
+            handle_restart,
+            sync_flock_size,
+            flocking.run_if(move || !nosim),
+        )
+            .chain()
+            .after(update_sim_bounds)
+            .run_if(move || cpu)
+            // Steps while playing AND behind the menu (the live backdrop).
+            .run_if(sim_active),
+    );
 }
 
 /// One boid: position and velocity in world px / px-per-second.
@@ -69,116 +63,6 @@ pub struct BoidState {
 /// of the per-frame counting sort; boids carry no identity.
 #[derive(Resource, Default)]
 pub struct Flock(pub Vec<BoidState>);
-
-/// True while the cursor is busy on the UI — the flock ignores the mouse
-/// then, like `ignore_mouse` in the original.
-#[derive(Resource, Default)]
-pub struct PointerOverUi(pub bool);
-
-/// Set by the UI (or the R key) to respawn the flock.
-#[derive(Resource, Default)]
-pub struct RestartRequested(pub bool);
-
-/// Perf-test only (`boids <count> pin`): pretend the mouse sits at screen
-/// centre. A spawn blob disperses in under a second, so the only way to
-/// measure the sustained worst case — the whole flock held in a dense ring —
-/// is a permanent attractor.
-#[derive(Resource, Default)]
-pub struct PinnedAttractor(pub bool);
-
-/// Perf-test only (`boids <count> headless`): there is no window; the camera
-/// renders to an offscreen texture instead of a swapchain.
-#[derive(Resource, Default)]
-pub struct HeadlessRender(pub bool);
-
-/// The offscreen texture headless mode renders into. Its presence also
-/// enables [`headless_snapshots`].
-#[derive(Resource)]
-struct HeadlessTarget(Handle<Image>);
-
-/// The simulation area. Mirrors the primary window's size while one exists;
-/// in headless perf runs it stays at the default window size so the flock
-/// density (and therefore the workload) matches the windowed game.
-#[derive(Resource)]
-pub struct SimBounds(pub Vec2);
-
-impl Default for SimBounds {
-    fn default() -> Self {
-        Self(Vec2::new(1280.0, 800.0))
-    }
-}
-
-/// Keep [`SimBounds`] in sync with the window (live resizing included).
-pub fn update_sim_bounds(
-    window: Query<&Window, With<PrimaryWindow>>,
-    mut bounds: ResMut<SimBounds>,
-) {
-    if let Ok(window) = window.single() {
-        bounds.0 = Vec2::new(window.width(), window.height()).max(Vec2::ONE);
-    }
-}
-
-/// In headless perf runs, save the offscreen target to
-/// `/tmp/boids_headless_{0,1,2}.png` every few seconds (cycling), so the
-/// flock's behaviour stays visually verifiable even while the machine's
-/// display is asleep — macOS throttles presentation then, but offscreen
-/// rendering is unaffected.
-fn headless_snapshots(
-    mut commands: Commands,
-    time: Res<Time>,
-    target: Option<Res<HeadlessTarget>>,
-    mut next: Local<f32>,
-    mut index: Local<u32>,
-) {
-    let Some(target) = target else { return };
-    if *next == 0.0 {
-        // Skip the first seconds: the flock is still dispersing from spawn.
-        *next = 4.0;
-        return;
-    }
-    if time.elapsed_secs() < *next {
-        return;
-    }
-    *next = time.elapsed_secs() + 5.0;
-    let path = format!("/tmp/boids_headless_{}.png", *index % 3);
-    *index += 1;
-    commands
-        .spawn(Screenshot::image(target.0.clone()))
-        .observe(save_to_disk(path));
-}
-
-fn setup(
-    mut commands: Commands,
-    mut images: ResMut<Assets<Image>>,
-    headless: Res<HeadlessRender>,
-    bounds: Res<SimBounds>,
-) {
-    if headless.0 {
-        // No window to present to: render into an offscreen texture of the
-        // same size, so perf runs exercise the real render pipeline.
-        let mut target = Image::new_fill(
-            Extent3d {
-                width: bounds.0.x as u32,
-                height: bounds.0.y as u32,
-                depth_or_array_layers: 1,
-            },
-            TextureDimension::D2,
-            &[0, 0, 0, 255],
-            TextureFormat::Bgra8UnormSrgb,
-            RenderAssetUsages::default(),
-        );
-        target.texture_descriptor.usage =
-            TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT;
-        let handle = images.add(target);
-        commands.insert_resource(HeadlessTarget(handle.clone()));
-        // Msaa off: the LÖVE original drew without antialiasing, and at high
-        // counts the flock piles up — 4x the blending samples is pure
-        // fill-rate cost on exactly those frames.
-        commands.spawn((Camera2d, Msaa::Off, RenderTarget::Image(handle.into())));
-    } else {
-        commands.spawn((Camera2d, Msaa::Off));
-    }
-}
 
 /// Random position on screen, random heading, random speed up to max — the
 /// original's `initPositions` / `initVelocities`.
@@ -385,7 +269,11 @@ struct FlockSoa<'a> {
 /// original's `d > 0` check. All accumulators are plain locals in one flat
 /// loop so they stay in NEON registers.
 #[inline(always)]
-fn neighbour_rules(p: Vec2, soa: FlockSoa, runs: &[(usize, usize)]) -> (Vec2, Vec2, Vec2, f32, f32) {
+fn neighbour_rules(
+    p: Vec2,
+    soa: FlockSoa,
+    runs: &[(usize, usize)],
+) -> (Vec2, Vec2, Vec2, f32, f32) {
     let px4 = Vec4::splat(p.x);
     let py4 = Vec4::splat(p.y);
     // Hoisted constants: written inline in the loop, each `splat` compiles
@@ -468,6 +356,7 @@ fn neighbour_rules(p: Vec2, soa: FlockSoa, runs: &[(usize, usize)]) -> (Vec2, Ve
 fn flocking(
     time: Res<Time>,
     settings: Res<SimSettings>,
+    state: Res<State<AppState>>,
     pointer_over_ui: Res<PointerOverUi>,
     pinned: Res<PinnedAttractor>,
     bounds: Res<SimBounds>,
@@ -486,8 +375,12 @@ fn flocking(
     let (separation, alignment, cohesion) =
         (settings.separation, settings.alignment, settings.cohesion);
 
-    // Cursor in world space; `None` while outside the window or busy on UI.
-    let mouse = if pinned.0 {
+    // Cursor in world space; `None` while outside the window, busy on UI,
+    // or running ambiently behind the menu — the original's
+    // `menuBg:update(dt, true)`.
+    let mouse = if *state.get() == AppState::Menu {
+        None
+    } else if pinned.0 {
         Some(Vec2::ZERO)
     } else if pointer_over_ui.0 {
         None
@@ -560,8 +453,14 @@ fn flocking(
     g.spy.resize(n, 0.0);
     g.svx.resize(n, 0.0);
     g.svy.resize(n, 0.0);
-    let (spx, spy) = (ScatterPtr(g.spx.as_mut_ptr()), ScatterPtr(g.spy.as_mut_ptr()));
-    let (svx, svy) = (ScatterPtr(g.svx.as_mut_ptr()), ScatterPtr(g.svy.as_mut_ptr()));
+    let (spx, spy) = (
+        ScatterPtr(g.spx.as_mut_ptr()),
+        ScatterPtr(g.spy.as_mut_ptr()),
+    );
+    let (svx, svy) = (
+        ScatterPtr(g.svx.as_mut_ptr()),
+        ScatterPtr(g.svy.as_mut_ptr()),
+    );
     let cell_of = &g.cell_of;
     ComputeTaskPool::get().scope(|scope| {
         for (boids, (cells, cursors)) in flock_ref
@@ -682,8 +581,10 @@ fn flocking(
                         }
                         Some(_) => MOUSE_ATTRACT_K,
                     };
-                    let (has_avoid, has_align) =
-                        ((cnt_avoid > 0.0) as u32 as f32, (cnt_align > 0.0) as u32 as f32);
+                    let (has_avoid, has_align) = (
+                        (cnt_avoid > 0.0) as u32 as f32,
+                        (cnt_align > 0.0) as u32 as f32,
+                    );
                     let acc = steering_forces(
                         Vec4::new(sum_separate.x, sum_align.x, cohere.x, mouse_diff.x),
                         Vec4::new(sum_separate.y, sum_align.y, cohere.y, mouse_diff.y),
