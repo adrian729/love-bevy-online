@@ -1,16 +1,20 @@
 # love-bevy-online — the LÖVE experiments in Bevy/Rust
 
 A Bevy port of the LÖVE/Lua `love-online` project: a start menu with a
-live experiment animating behind it, and two experiments so far —
-**flock** (Reynolds boids) and **fish** (a procedural FABRIK fish that
+live experiment animating behind it, and three experiments so far —
+**flock** (Reynolds boids), **fish** (a procedural FABRIK fish that
 grows by eating, swimming as a whole school of boids once the Fish slider
-goes past 1). Same simulation rules, same tunables, same UI behaviour —
+goes past 1), and **flow field** (a Perlin-noise vector field shown as
+streamlines, arrows, a colour gradient, or particles riding it with
+glowing trails). Same simulation rules, same tunables, same UI behaviour —
 rebuilt on Bevy to see how far the same experiments can be pushed in Rust.
 
 Answer so far: **the LÖVE original capped at 300 boids; this port holds
 ~100+ fps at 640,000**, with the slider allowing 1.28 million. The fish
 school holds ~100+ fps at 4,096 spline-rendered fish (the original's
 school suggested raising past ~30 "with care"), slider allowing 8,192.
+The flow field holds ~120 fps at 140,000 glowing-trail particles (the
+original capped its slider at 6,000), slider allowing 300,000.
 
 ```sh
 cargo run            # dev profile: fast iteration (dynamic linking, opt-level 1)
@@ -127,7 +131,7 @@ That's where the optimize-without-changing-behaviour loop stops.
 ### Perf harness
 
 ```sh
-cargo run --release -- <count> [fish] [pin] [headless] [cpu] [nosim] [geo]
+cargo run --release -- <count> [fish|flow] [pin] [headless] [cpu] [nosim] [geo]
 ```
 
 Prints fps once a second (vsync off). Any CLI argument skips the menu and
@@ -140,6 +144,13 @@ across versions. Flags compose:
   case; without `pin`, headless runs have no pointer and the school
   flocks freely). Certified: a school of 4096 at ≥~100 fps on the M4
   Pro; see ARCHITECTURE.md.
+- `flow` — perf-test the flow field: `<count>` particles ride the field.
+  Extra flags pick the other views (`streamlines`, `arrows`, `gradient`),
+  `evolve` animates the field, `worst` sets the field-rebuild worst case
+  (scale 4, octaves 6, warp 5, evolve, maxed streamline detail/length),
+  `fade04` the shortest trails; `detail=N`/`length=N`/`seed=N` override
+  single tunables for probe grids. Certified: 140,000 particles at
+  ~120 fps on the M4 Pro.
 - `pin` — fake mouse attractor at screen centre (sustained worst case).
 - `headless` — no window: renders to an offscreen texture, schedule
   free-runs, and a snapshot lands in `/tmp/boids_headless_{0,1,2}.png`
@@ -186,8 +197,9 @@ target-gated.
 | SUIT immediate-mode sliders/buttons | Hand-rolled retained `bevy_ui` sliders (`Interaction::Pressed` persists through a drag) |
 | `pointerOverUI` → `ignore_mouse` | `PointerOverUi` resource |
 | `state = 'menu' / 'playing' / 'options'` | `States` enum; sim steps in `Menu` (the live backdrop) and `Playing`, popup on `OnEnter(Options)` |
-| `minigames` registry + menu backdrop pool | `src/experiments/` registry; flock + fish, random backdrop per menu visit |
+| `minigames` registry + menu backdrop pool | `src/experiments/` registry; flock + fish + flow, random backdrop per menu visit |
 | `school.lua` (boids of fish, its own minigame) | The fish experiment's "Fish" slider: count > 1 swims the school's boids rules, food objective kept |
+| `lib/flow.lua` angle grid + canvas blit + particle trails | `FlowField` resource + a re-emitted-on-rebuild static layer; trails expand from raw ring buffers in the vertex shader |
 
 Steering constants kept from the original: `max_force 0.3`, separation radius
 50 px, neighbour radius 100 px, mouse attract `k = 4` / repel `k = -6` inside
@@ -195,7 +207,7 @@ Steering constants kept from the original: `max_force 0.3`, separation radius
 
 Deliberate differences:
 
-- The menu lists two experiments so far (the original had five), with a
+- The menu lists three experiments so far (the original had five), with a
   random backdrop picked per visit like the original's pool.
 - The original kept "fish" and "school" as separate minigames; here the
   school is the fish experiment's count slider — and unlike the original's
@@ -215,6 +227,28 @@ Deliberate differences:
   stationary-pointer orbit, schooled. Pointer movement releases the
   mill instantly, and the food pull rides outside it, so a milling
   school still dives and eats.
+- The flow field is deliberately *better* than the original rather than
+  1:1 (the rest of its tunables, palettes, and view modes are the
+  original's). The original samples the nearest grid cell (trajectories
+  kink at every cell edge) and steps with Euler; this port interpolates
+  the field bilinearly (direction-vector lerp, so the angle wrap is
+  seamless) and advects with RK2 — streamlines and particle paths are
+  smooth curves. New `Evolve` tunable: the field drifts through a third
+  noise dimension over time (0 = static, the original). The gradient view
+  interpolates colours across cells instead of flat rects; streamlines
+  are tapered, feathered ribbons instead of uniform hairlines; trails
+  record at a fixed 60 Hz of simulated time (the original recorded per
+  frame, so its trails shrank as fps rose); and the seed pans the noise
+  offset linearly instead of reshuffling (each integer seed used to
+  re-roll an RNG) — every integer seed below 256,000 is a distinct
+  field (the slider spans them all; the offset wraps the Perlin
+  lattice's 256-unit period, so any seed keeps full float precision),
+  and clicking the Seed value label (or any flow value label) types or
+  pastes an exact value — Cmd/Ctrl+C/V — to share a field. Particle
+  trails are expanded on the GPU from each particle's raw ring buffer
+  (a vertex-pull shader; the glow's cross profile is computed per
+  fragment, halving the vertex work), which is what buys the
+  140k-particle ceiling.
 - An FPS readout under the score, to compare runtimes (the point of the
   experiment) — plus a VSync checkbox in the options popup, so a normal run
   can uncap presentation without the perf harness. Heads-up when reading

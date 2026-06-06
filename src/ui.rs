@@ -10,6 +10,7 @@
 
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::relationship::RelatedSpawnerCommands;
+use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, UiGlobalTransform};
 use bevy::window::PrimaryWindow;
@@ -40,6 +41,8 @@ pub fn plugin(app: &mut App) {
                 keyboard_options_toggle,
                 nav_button_actions,
                 slider_feedback,
+                show_value_edits,
+                value_label_hover,
                 sync_hud_visibility,
                 update_hud_fps,
             ),
@@ -230,6 +233,15 @@ pub fn slider_plugin<B: SliderBinding>(app: &mut App) {
     app.add_systems(Update, (drag_sliders::<B>, sync_slider_visuals::<B>));
 }
 
+/// Register the typed-value-entry systems for one binding type — opt-in
+/// per experiment (flow uses it for exact seeds); the other experiments'
+/// sliders stay drag-only, untouched. The experiment must also give its
+/// value labels an `Interaction` to make them clickable (flow tags its
+/// own; see `make_value_labels_editable`).
+pub fn value_entry_plugin<B: SliderBinding>(app: &mut App) {
+    app.add_systems(Update, (begin_value_edits::<B>, edit_value_input::<B>));
+}
+
 /// Draggable slider bar; carries its binding component alongside.
 #[derive(Component)]
 pub struct SliderTrack;
@@ -359,20 +371,365 @@ fn slider_feedback(
 }
 
 /// Keep every bound widget (fill width, value text) in sync with the
-/// settings, wherever the change came from (panel, popup, or reset).
+/// settings, wherever the change came from (panel, popup, or reset) — and
+/// after a typed edit ends, restoring the label a cancelled edit borrowed
+/// (a label mid-edit shows its buffer instead and is skipped here).
 fn sync_slider_visuals<B: SliderBinding>(
     settings: Res<B::Settings>,
+    mut ended_edits: RemovedComponents<ValueEdit>,
     mut fills: Query<(&B, &mut Node), With<SliderFill>>,
-    mut labels: Query<(&B, &mut Text), With<ValueLabel>>,
+    mut labels: Query<(&B, &mut Text, &mut TextColor), (With<ValueLabel>, Without<ValueEdit>)>,
 ) {
-    if !settings.is_changed() {
+    let edit_ended = !ended_edits.is_empty();
+    ended_edits.clear();
+    if !settings.is_changed() && !edit_ended {
         return;
     }
     for (binding, mut node) in &mut fills {
         node.width = Val::Percent(binding.t(&settings) * 100.0);
     }
-    for (binding, mut text) in &mut labels {
+    for (binding, mut text, mut color) in &mut labels {
         text.0 = binding.format(binding.get(&settings));
+        if edit_ended {
+            color.0 = COLOR_TEXT_DIM;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed value entry — opt-in per experiment (only flow registers it; the
+// flock/fish sliders are exactly as they were).
+//
+// Click a slider's value label to type the value instead of dragging:
+// digits land in a buffer shown in place of the value, [Enter] commits
+// (through the binding's `set`, so its range still clamps), [Esc] cancels,
+// and Cmd/Ctrl+V / Cmd/Ctrl+C paste and copy the buffer — the way to share
+// exact values (a flow seed) between sessions or people. Clicking another
+// value label commits the open edit first. One edit can be open at a time,
+// and an edit only exists while its experiment is front and center (flow
+// cancels its edits on any screen change).
+//
+// While an edit is open the global key bindings stand down: [Esc] cancels
+// the edit instead of toggling the options popup, and [R] types nothing
+// rather than restarting the experiment — the handlers that could fire
+// check [`ValueEdit`] (deferred removal keeps the marker visible to all
+// systems for the rest of the frame, whatever their order).
+
+/// An in-progress typed edit on a slider's value label. Public (and its
+/// query type below) so global key handlers can stand down while typing.
+#[derive(Component)]
+pub struct ValueEdit {
+    buffer: String,
+}
+
+/// Longest accepted entry — past any real value, short of nonsense.
+const VALUE_EDIT_MAX_LEN: usize = 12;
+
+/// Keep only characters that can appear in a number (paste filtering).
+fn filter_value_chars(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .take(VALUE_EDIT_MAX_LEN)
+        .collect()
+}
+
+/// A finished entry's value, if it parses to something usable.
+fn parse_typed_value(buffer: &str) -> Option<f32> {
+    buffer.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_clipboard_text(text: &str) {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text.to_owned());
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clipboard_text() -> Option<String> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_clipboard_text(_text: &str) {}
+
+/// A click on a value label opens a typed edit seeded with the current
+/// value (so Cmd/Ctrl+C right away copies it). An edit already open on
+/// another label commits first; one from another experiment's binding
+/// type (only possible across a hot experiment switch) cancels.
+fn begin_value_edits<B: SliderBinding>(
+    mut commands: Commands,
+    mut settings: ResMut<B::Settings>,
+    clicked: Query<
+        (Entity, &Interaction, &B),
+        (Changed<Interaction>, With<ValueLabel>, Without<ValueEdit>),
+    >,
+    open: Query<(Entity, &B, &ValueEdit), With<ValueLabel>>,
+    strays: Query<Entity, (With<ValueEdit>, Without<B>)>,
+) {
+    for (entity, interaction, binding) in &clicked {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        for (other, other_binding, edit) in &open {
+            if let Some(value) = parse_typed_value(&edit.buffer) {
+                other_binding.set(&mut settings, value);
+            }
+            commands.entity(other).remove::<ValueEdit>();
+        }
+        for stray in &strays {
+            commands.entity(stray).remove::<ValueEdit>();
+        }
+        commands.entity(entity).insert(ValueEdit {
+            buffer: binding.format(binding.get(&settings)),
+        });
+    }
+}
+
+/// Route the keyboard into the open edit: characters into the buffer,
+/// [Enter] commits through the binding (its `set` clamps to the range),
+/// [Esc] cancels, Cmd/Ctrl+V replaces the buffer with the clipboard,
+/// Cmd/Ctrl+C copies it.
+fn edit_value_input<B: SliderBinding>(
+    mut commands: Commands,
+    mut events: MessageReader<KeyboardInput>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut settings: ResMut<B::Settings>,
+    mut edits: Query<(Entity, &B, &mut ValueEdit), With<ValueLabel>>,
+) {
+    let Ok((entity, binding, mut edit)) = edits.single_mut() else {
+        // Stay drained so a freshly opened edit doesn't replay the
+        // previous frames' keys.
+        events.clear();
+        return;
+    };
+    let modifier = keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight)
+        || keys.pressed(KeyCode::ControlLeft)
+        || keys.pressed(KeyCode::ControlRight);
+    if modifier && keys.just_pressed(KeyCode::KeyC) {
+        set_clipboard_text(&edit.buffer);
+    }
+    if modifier && keys.just_pressed(KeyCode::KeyV) {
+        let pasted = clipboard_text().as_deref().map(filter_value_chars);
+        if let Some(pasted) = pasted.filter(|p| !p.is_empty()) {
+            edit.buffer = pasted;
+        }
+    }
+    for event in events.read() {
+        if !event.state.is_pressed() {
+            continue;
+        }
+        match &event.logical_key {
+            Key::Character(typed) if !modifier => {
+                for c in typed.chars() {
+                    if (c.is_ascii_digit() || c == '.' || c == '-')
+                        && edit.buffer.len() < VALUE_EDIT_MAX_LEN
+                    {
+                        edit.buffer.push(c);
+                    }
+                }
+            }
+            Key::Backspace => {
+                edit.buffer.pop();
+            }
+            Key::Enter => {
+                if let Some(value) = parse_typed_value(&edit.buffer) {
+                    binding.set(&mut settings, value);
+                }
+                commands.entity(entity).remove::<ValueEdit>();
+                break;
+            }
+            Key::Escape => {
+                commands.entity(entity).remove::<ValueEdit>();
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Show the open edit's buffer (with a caret) in the value label, in the
+/// active color. The label's normal text comes back via
+/// `sync_slider_visuals` when the edit ends.
+fn show_value_edits(
+    mut edits: Query<(&ValueEdit, &mut Text, &mut TextColor), Changed<ValueEdit>>,
+) {
+    for (edit, mut text, mut color) in &mut edits {
+        text.0 = format!("{}_", edit.buffer);
+        color.0 = COLOR_ACTIVE;
+    }
+}
+
+/// Make the value labels read as clickable: brighten on hover.
+fn value_label_hover(
+    mut labels: Query<
+        (&Interaction, &mut TextColor),
+        (Changed<Interaction>, With<ValueLabel>, Without<ValueEdit>),
+    >,
+) {
+    for (interaction, mut color) in &mut labels {
+        color.0 = match interaction {
+            Interaction::None => COLOR_TEXT_DIM,
+            _ => Color::WHITE,
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Option cyclers
+//
+// The original's `type = 'options'` tunables (the flow field's View and
+// Palette pickers): a row of `Label  ‹ Value ›` where the arrow buttons step
+// through a fixed option list. Same shape as the sliders: a binding trait an
+// experiment implements per enum tunable, generic systems registered once
+// per binding type.
+
+/// Binds a cycler to one enum field of an experiment's settings resource,
+/// as an index into its option list.
+pub trait CyclerBinding: Component + Copy {
+    type Settings: Resource;
+
+    fn label(self) -> &'static str;
+    /// How many options the list has.
+    fn count(self) -> usize;
+    /// Index of the current option.
+    fn get(self, settings: &Self::Settings) -> usize;
+    fn set(self, settings: &mut Self::Settings, index: usize);
+    /// Display name of one option.
+    fn option_label(self, index: usize) -> &'static str;
+}
+
+/// Register the click/sync systems for one cycler binding type.
+pub fn cycler_plugin<B: CyclerBinding>(app: &mut App) {
+    app.add_systems(Update, (cycle_clicks::<B>, sync_cycler_labels::<B>));
+}
+
+/// One of a cycler's step buttons; `0` holds -1 (‹) or +1 (›).
+#[derive(Component)]
+pub struct CyclerArrow(pub i32);
+
+/// Text showing a cycler's current option.
+#[derive(Component)]
+pub struct CyclerValueLabel;
+
+/// Label on the left, `‹ Value ›` on the right. The whole row carries
+/// `row_marker`, like the sliders, so callers can show/hide it.
+pub fn spawn_cycler<B: CyclerBinding>(
+    parent: &mut ChildSpawner,
+    row_marker: impl Bundle,
+    binding: B,
+    settings: &B::Settings,
+    font_size: f32,
+) {
+    parent
+        .spawn((
+            row_marker,
+            Node {
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                width: Val::Percent(100.0),
+                ..default()
+            },
+        ))
+        .with_children(|row| {
+            row.spawn((
+                Text::new(binding.label()),
+                TextFont::from_font_size(font_size),
+                TextColor(Color::WHITE),
+            ));
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(6.0),
+                ..default()
+            })
+            .with_children(|picker| {
+                let arrow = |picker: &mut ChildSpawner, delta: i32, glyph: &str| {
+                    picker
+                        .spawn((
+                            Button,
+                            binding,
+                            CyclerArrow(delta),
+                            Node {
+                                width: Val::Px(18.0),
+                                height: Val::Px(18.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(COLOR_NORMAL),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new(glyph),
+                                TextFont::from_font_size(font_size),
+                                TextColor(Color::WHITE),
+                            ));
+                        });
+                };
+                arrow(picker, -1, "<");
+                row_value(picker, binding, settings, font_size);
+                arrow(picker, 1, ">");
+            });
+        });
+
+    fn row_value<B: CyclerBinding>(
+        picker: &mut ChildSpawner,
+        binding: B,
+        settings: &B::Settings,
+        font_size: f32,
+    ) {
+        picker.spawn((
+            CyclerValueLabel,
+            binding,
+            Text::new(binding.option_label(binding.get(settings))),
+            TextFont::from_font_size(font_size),
+            TextColor(COLOR_TEXT_DIM),
+            Node {
+                width: Val::Px(86.0),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            TextLayout::new_with_justify(Justify::Center),
+        ));
+    }
+}
+
+/// A click on either arrow steps the bound option, wrapping around.
+fn cycle_clicks<B: CyclerBinding>(
+    arrows: Query<(&Interaction, &B, &CyclerArrow), Changed<Interaction>>,
+    mut settings: ResMut<B::Settings>,
+) {
+    for (interaction, binding, arrow) in &arrows {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let count = binding.count() as i32;
+        let next = (binding.get(&settings) as i32 + arrow.0).rem_euclid(count);
+        binding.set(&mut settings, next as usize);
+    }
+}
+
+/// Keep every bound value label in sync with the settings, wherever the
+/// change came from — also right after spawning (`Added`).
+fn sync_cycler_labels<B: CyclerBinding>(
+    settings: Res<B::Settings>,
+    added: Query<(), Added<CyclerValueLabel>>,
+    mut labels: Query<(&B, &mut Text), With<CyclerValueLabel>>,
+) {
+    if !settings.is_changed() && added.is_empty() {
+        return;
+    }
+    for (binding, mut text) in &mut labels {
+        text.0 = binding.option_label(binding.get(&settings)).into();
     }
 }
 
@@ -581,12 +938,17 @@ pub fn despawn_options_popup(mut commands: Commands, popups: Query<Entity, With<
 
 /// [Esc] / [O] toggles the options popup, pausing the simulation — the
 /// original's `love.keypressed`. (The menu handles its own keys: Esc quits
-/// there.)
+/// there.) Stands down while a value is being typed: [Esc] then cancels
+/// the edit, and an "o" keystroke is just a rejected character.
 fn keyboard_options_toggle(
     keys: Res<ButtonInput<KeyCode>>,
     state: Res<State<AppState>>,
     mut next: ResMut<NextState<AppState>>,
+    edits: Query<(), With<ValueEdit>>,
 ) {
+    if !edits.is_empty() {
+        return;
+    }
     if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::KeyO) {
         match state.get() {
             AppState::Playing => next.set(AppState::Options),
@@ -644,5 +1006,163 @@ fn track_pointer_over_ui(
         .any(|interaction| *interaction != Interaction::None);
     if pointer_over_ui.0 != over {
         pointer_over_ui.0 = over;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pasted text keeps only numeric characters, capped in length.
+    #[test]
+    fn filter_value_chars_strips_noise() {
+        assert_eq!(filter_value_chars("seed: 123456"), "123456");
+        assert_eq!(filter_value_chars("-0.25\n"), "-0.25");
+        assert_eq!(filter_value_chars("hello"), "");
+        assert_eq!(filter_value_chars("123456789012345678").len(), 12);
+    }
+
+    /// Typed entries parse leniently but reject the unusable.
+    #[test]
+    fn parse_typed_value_accepts_numbers_only() {
+        assert_eq!(parse_typed_value("123456"), Some(123456.0));
+        assert_eq!(parse_typed_value(" 0.25 "), Some(0.25));
+        assert_eq!(parse_typed_value("-100"), Some(-100.0));
+        assert_eq!(parse_typed_value(""), None);
+        assert_eq!(parse_typed_value("-"), None);
+        assert_eq!(parse_typed_value("1.2.3"), None);
+        assert_eq!(parse_typed_value("inf"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // The full click → type → commit/cancel flow, driven headlessly with
+    // synthetic Interaction and KeyboardInput.
+
+    #[derive(Resource)]
+    struct TestSettings {
+        value: f32,
+    }
+
+    #[derive(Component, Clone, Copy)]
+    struct TestParam;
+
+    impl SliderBinding for TestParam {
+        type Settings = TestSettings;
+
+        fn label(self) -> &'static str {
+            "Test"
+        }
+        fn range(self) -> (f32, f32) {
+            (0.0, 256_000.0)
+        }
+        fn get(self, settings: &TestSettings) -> f32 {
+            settings.value
+        }
+        fn set(self, settings: &mut TestSettings, value: f32) {
+            let (min, max) = self.range();
+            settings.value = value.clamp(min, max);
+        }
+        fn format(self, value: f32) -> String {
+            format!("{}", value.round() as i32)
+        }
+    }
+
+    fn edit_app() -> (App, Entity) {
+        let mut app = App::new();
+        app.insert_resource(TestSettings { value: 1234.0 })
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_message::<KeyboardInput>()
+            .add_systems(Update, show_value_edits);
+        slider_plugin::<TestParam>(&mut app);
+        value_entry_plugin::<TestParam>(&mut app);
+        let label = app
+            .world_mut()
+            .spawn((
+                ValueLabel,
+                TestParam,
+                Interaction::None,
+                Text::new("1234"),
+                TextColor(COLOR_TEXT_DIM),
+            ))
+            .id();
+        app.update();
+        (app, label)
+    }
+
+    fn press(app: &mut App, logical_key: Key) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::F35, // unused by anything under test
+            logical_key,
+            state: bevy::input::ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+
+    fn click(app: &mut App, label: Entity) {
+        *app.world_mut().get_mut::<Interaction>(label).unwrap() = Interaction::Pressed;
+        app.update();
+        // Commands flush between updates; let the insert land everywhere.
+        app.update();
+    }
+
+    /// Click opens an edit seeded with the current value; typed digits
+    /// append; Enter commits through the binding's clamp.
+    #[test]
+    fn typed_edit_commits_on_enter() {
+        let (mut app, label) = edit_app();
+        click(&mut app, label);
+        let edit = app.world().get::<ValueEdit>(label).expect("edit open");
+        assert_eq!(edit.buffer, "1234");
+        // Type two more digits: 1234 -> 123456.
+        press(&mut app, Key::Character("5".into()));
+        press(&mut app, Key::Character("6".into()));
+        assert_eq!(app.world().get::<ValueEdit>(label).unwrap().buffer, "123456");
+        // The label shows the buffer with a caret while editing (the
+        // display may trail the keystroke by one frame).
+        app.update();
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "123456_");
+        press(&mut app, Key::Enter);
+        app.update();
+        assert_eq!(app.world().resource::<TestSettings>().value, 123456.0);
+        assert!(app.world().get::<ValueEdit>(label).is_none(), "edit closed");
+        // The label is back to showing the (formatted) committed value.
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "123456");
+    }
+
+    /// Escape cancels: the settings keep their old value and the label
+    /// text is restored.
+    #[test]
+    fn typed_edit_cancels_on_escape() {
+        let (mut app, label) = edit_app();
+        click(&mut app, label);
+        press(&mut app, Key::Character("9".into()));
+        press(&mut app, Key::Escape);
+        app.update();
+        assert_eq!(app.world().resource::<TestSettings>().value, 1234.0);
+        assert!(app.world().get::<ValueEdit>(label).is_none());
+        assert_eq!(app.world().get::<Text>(label).unwrap().0, "1234");
+    }
+
+    /// Commits clamp to the binding's range, and non-numeric characters
+    /// (an "r" — the restart key) never reach the buffer.
+    #[test]
+    fn typed_edit_clamps_and_filters() {
+        let (mut app, label) = edit_app();
+        click(&mut app, label);
+        // Backspace the seeded value away, then type past the range max.
+        for _ in 0..4 {
+            press(&mut app, Key::Backspace);
+        }
+        press(&mut app, Key::Character("r".into()));
+        for _ in 0..7 {
+            press(&mut app, Key::Character("9".into()));
+        }
+        assert_eq!(app.world().get::<ValueEdit>(label).unwrap().buffer, "9999999");
+        press(&mut app, Key::Enter);
+        app.update();
+        assert_eq!(app.world().resource::<TestSettings>().value, 256_000.0);
     }
 }

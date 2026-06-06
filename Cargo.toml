@@ -17,6 +17,12 @@ bytemuck = { version = "1", features = ["derive"] }
 log = { version = "0.4", features = ["max_level_debug", "release_max_level_warn"] }
 rand = "0.9"
 
+# Typed entry on the slider value labels: Cmd/Ctrl+C/V copy and paste of
+# exact values (e.g. flow seeds). Native only — the web build still types,
+# it just has no clipboard access.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard = "3"
+
 # Browser builds only (`web/build.sh`): rand's entropy source needs an
 # explicit opt-in to the browser-crypto backend on wasm. This is half of the
 # opt-in; the matching `--cfg getrandom_backend="wasm_js"` rustflag lives in

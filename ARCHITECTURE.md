@@ -23,8 +23,12 @@ registry. A thin shared shell wraps the experiments:
   the menu, which also picks a random backdrop per visit — `menuBgPool`).
   The chrome the original kept in `main.lua` — HUD (score/fps/hint), the
   options-popup shell with its nav buttons, [Esc]/[O] pause, the generic
-  slider (`SliderBinding`) and checkbox widgets — lives in `src/ui.rs`;
-  experiments contribute only their own content.
+  slider (`SliderBinding`), checkbox, and option-cycler (`CyclerBinding`,
+  the original's `type = 'options'` tunables) widgets — lives in
+  `src/ui.rs`; experiments contribute only their own content. The typed
+  value entry on slider value labels (`value_entry_plugin`) is opt-in
+  per experiment — only flow registers it; the flock/fish sliders are
+  exactly as they were.
 
 The flock experiment itself (`src/experiments/flock/`):
 
@@ -137,6 +141,96 @@ which reads ~77–99 pinned. The floor there is per-fish CPU geometry plus
 ~78MB/frame of vertex traffic; the identified next lever is GPU-side
 geometry generation from uploaded spines (~1MB/frame), an investment of
 the same shape as the flock's compute sim.
+
+## The flow-field experiment (`src/experiments/flow/`)
+
+A port of the original's `minigames/flow.lua` + `lib/flow.lua` — a grid
+of flow angles from fractal Perlin noise (octaves, domain warp, swirl
+bias), shown as streamlines, per-cell arrows, a colour gradient, or
+particles riding the field with glowing trails. Unlike the other two,
+this port is deliberately **better, not 1:1** (the explicit request):
+tunable ranges, defaults, palettes, and view semantics are the
+original's; the behavior upgrades are documented as a list in
+`sim.rs`'s module docs. The headline ones: bilinear field sampling
+(direction-*vector* lerp, wrap-safe — the Lua reads the nearest cell, so
+every trajectory kinks at cell edges), RK2 advection, an `Evolve`
+tunable (the field drifts through a third noise dimension at a fixed
+30 Hz tick; 0 = static = the original), a smoothly interpolated gradient
+view, tapered feathered streamline ribbons, frame-rate-independent
+trails (fixed 60 Hz of simulated time; the Lua recorded one sample per
+rendered frame), and continuous seeds (the seed pans the noise offset
+linearly instead of re-rolling an RNG, and the raw f32 slider value
+sits in the rebuild signature, so small seed steps morph). The Seed
+slider spans all **256,000 distinct fields** — the joint period of the
+two per-seed pans over the Perlin lattice's 256-unit repeat — and the
+offset wraps into that lattice period (`seed_base`), so every seed
+keeps full f32 noise precision. Exact seeds are shareable: flow's
+value labels accept typed input (click → type → [Enter], Cmd/Ctrl+C/V
+to copy/paste) via the opt-in `value_entry_plugin`. Every tunable
+range was audited: caps are either widened past the original's
+arbitrary ones or kept with a stated physical/measured reason
+(`FlowParam::range`'s per-line notes).
+
+- `sim.rs` — its own deterministic 3D Perlin (fixed permutation table,
+  like `love.math.noise`'s global one; the seed moves the sample offsets
+  instead — that's what makes scrubbing continuous), fbm with the Lua's
+  octave/persistence shape and its sequential warp dependency kept,
+  `FlowField` (angles + unit dirs, row-major), streamline tracing and
+  the particle SoA (positions, lifetimes, 20-sample trail ring buffers),
+  all in window coordinates. Rebuilds are chunk-parallel on the compute
+  pool and throttled to ~15/s while a slider is held with an exact
+  rebuild on release (the original's `REBUILD_THROTTLE`). The Lua's
+  `signature()` is a `PartialEq` struct of the build-affecting tunables.
+  Everything random is a tiny xorshift64* seeded from the field seed —
+  fields, streamline starts, and particle spawns reproduce exactly in
+  tests, no `rand` in the sim path.
+- `render.rs` — two layers, two pipelines, both blending premultiplied
+  alpha (one blend state serves the normal layers, `(rgb·a, a)`, and the
+  additive trail glow, `(rgb·a, 0)`, chosen per vertex). The **static
+  layer** (background gradient + the current view's geometry) is the
+  original's render-once-to-a-canvas: CPU-built 12-byte-vertex triangles
+  re-emitted and re-uploaded only when the field's version bumps. The
+  **trail layer** is a GPU vertex-pull pipeline: the CPU uploads each
+  particle's raw ring buffer plus a 24-byte meta record (head position,
+  ring state, packed palette colour) and the vertex shader expands the
+  tapered glow ribbons and head dots from `vertex_index` alone — no
+  vertex or index buffer. One quad per segment: the glow's cross
+  profile (a tent — full at the spine, zero at the edges) is computed
+  per fragment from an interpolated coordinate, which halved the
+  vertex count of the original two-quads-per-segment expansion (and
+  made the head dot round instead of a diamond). CPU-expanded trails
+  were measured geometry-throughput-bound (~170MB/frame at 100k
+  particles through emit → merge → extract → upload; ~48 fps); the
+  ring buffers are ~18MB/frame, and with the fragment-profile quads
+  the same count reads ~168 fps — still bounded by GPU geometry work
+  (the known next lever is incremental ring-buffer uploads).
+  Angle→colour goes through a 256-entry linear-rgb LUT per palette
+  (the hsv conversion would otherwise run per particle per frame).
+- `ui.rs` — the original declares `onscreenControls = 'all'`, so the
+  top-right panel carries every tunable (gated rows included); the
+  options popup lays the same ~20 controls out in a two-column wrap
+  (flow-local — the shared popup shell is untouched). View/Palette are
+  the shared cycler widget's two bindings; `visibleIf` rows are marker
+  components toggling `Display`, the fish pattern. "New field" re-rolls
+  the seed only (the original's `regenerate`); [R]/Restart also respawns
+  the particles (`reset`). Flow opts its value labels into the shared
+  typed-entry systems (an `Interaction` marks them clickable) and
+  cancels any open edit the moment the screen changes, so an edit
+  never outlives flow being front and center — while one is open,
+  [Esc] cancels it instead of toggling the popup, and a typed "r"
+  doesn't restart.
+
+Perf (M4 Pro, headless): **140,000 particles certified at ~120 fps**
+(50k ≈ 340, 100k ≈ 168, 200k ≈ 88; the slider allows 300k ≈ 55 fps —
+≈2x certified, the flock/fish convention). The field-rebuild worst case
+(scale 4, octaves 6, warp 5, evolving at 30 Hz — ~64k cells × ~13 fbm
+samples each) reads ~880 fps thanks to the chunk-parallel rebuild; the
+streamline worst case (detail 2500 × length 300, retraced per evolve
+tick) holds ~160–215 fps. Detail's 2500 cap is *measured*, not
+inherited: at 5000 the retrace no longer fits inside one 30 Hz evolve
+tick, so every frame pays a full rebuild and fps cliffs to ~24. Length
+is border-bounded (lines leave the window long before the step cap), so
+doubling it to 300 was free.
 
 ## Boids are plain data, not entities
 

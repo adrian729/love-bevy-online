@@ -21,17 +21,21 @@ mod menu;
 mod ui;
 
 use app::AppState;
-use experiments::{CurrentExperiment, ExperimentId, fish, flock};
+use experiments::{CurrentExperiment, ExperimentId, fish, flock, flow};
 
 fn main() {
-    // Perf-test mode (`boids <count> [fish] [pin] [headless] [nosim]`):
+    // Perf-test mode (`boids <count> [fish|flow] [pin] [headless] [nosim]`):
     // print fps to stdout once a second, with vsync off so readings show
     // real headroom past the display's refresh rate. The count is boids by
-    // default, fish with the `fish` flag.
+    // default, fish with the `fish` flag, particles with `flow`.
     //   fish     — perf-test the fish experiment instead of the flock.
+    //   flow     — perf-test the flow-field experiment; extra flags
+    //              `streamlines`/`arrows`/`gradient` pick a non-default
+    //              view, `evolve` animates the field, `worst` sets the
+    //              field-rebuild worst case (see flow/settings.rs).
     //   pin      — fake mouse attractor at screen centre: the sustained worst
     //              case (the whole flock piled into a ring / fish stacked on
-    //              one spot).
+    //              one spot). No-op for flow (it has no mouse interaction).
     //   headless — no window at all; the camera renders to an offscreen
     //              texture and the schedule free-runs. Exercises the full
     //              sim + extract + batch + GPU pipeline, immune to display
@@ -47,6 +51,8 @@ fn main() {
     let quads = !flag("geo");
     let experiment = if flag("fish") {
         ExperimentId::Fish
+    } else if flag("flow") {
+        ExperimentId::Flow
     } else {
         ExperimentId::Flock
     };
@@ -98,6 +104,7 @@ fn main() {
             app::plugin,
             flock::FlockPlugin { quads, headless },
             fish::FishPlugin { headless },
+            flow::FlowPlugin { headless },
         ));
 
     // Perf runs (any CLI arg) skip the menu and boot straight into the
