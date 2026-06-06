@@ -114,7 +114,27 @@ machinery — different problem, different shape:
   128 neighbour candidates the 3x3 scan samples proportional salted
   blocks per bucket — the flock's `MAX_NEIGHBOUR_SAMPLES` trick,
   re-derived (the steering only uses aggregate directions); below the
-  cap the scan is exhaustive and Lua-exact.
+  cap the scan is exhaustive and Lua-exact. A third addition (LÖVE
+  could never observe it: its cursor always has a position): while the
+  pointer is **out of the window**, fish go for the food instead — the
+  lone fish swims to it directly (orbit state reset, so the pointer's
+  return starts a plain chase), and the school enters a *graze* mode:
+  the food takes over the mouse's far-field attraction (k = 4, no repel
+  ring) and the approach speed is capped at 0.8·turn_rate·distance.
+  The cap is what makes the eat land: the slew limiter gives every fish
+  a minimum turn radius of speed/turn_rate (64 px at the default 320 —
+  over three times the 20 px eat radius), and a turn-limited pursuer
+  chasing a point it cannot out-turn settles on a *stable orbit* at that
+  radius — the school circled the food forever. Capped, holding any
+  circle needs less turning than the limiter allows, so the orbit
+  contracts into a strike at every speed setting
+  (`grazing_school_breaks_the_orbit_and_eats` starts the school on the
+  stuck orbit itself, at the default speed and the slider max).
+  In-window behaviour is byte-identical to before; headless perf runs
+  have no window at all and stay pure flocking
+  (`lone_fish_grazes_while_the_pointer_is_away`,
+  `school_goes_for_the_food_while_the_pointer_is_away` drive the real
+  system against a scripted `Window` cursor).
 - `render.rs` — per-frame vector geometry in the original's painter order
   (food, lateral fins, tail, body, dorsal, eyes), each part splined with
   the original's Hermite "v2" algorithm (NOT Catmull-Rom), 0.5px-deduped,

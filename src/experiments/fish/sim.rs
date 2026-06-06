@@ -1,7 +1,10 @@
 //! The fish simulation: a 12-joint FABRIK spine chasing a (possibly
 //! sine-offset) target, plus the minigame rules — eat food, grow, orbit a
 //! stationary pointer. A direct behavioural port of `lib/fish.lua` +
-//! `lib/chain.lua` + `minigames/fish.lua`.
+//! `lib/chain.lua` + `minigames/fish.lua`, with one deliberate addition:
+//! while the pointer is out of the window, fish (and the school) go for
+//! the food instead — the moment it is back, the original rules apply
+//! untouched.
 //!
 //! Everything here works in **window coordinates** (top-left origin,
 //! y-down), exactly like the LÖVE original — `window.cursor_position()`
@@ -260,9 +263,9 @@ pub struct FishGame {
     circling: bool,
     orbit_angle: f32,
     orbit_dir: f32,
-    /// Previous frame's pointer, to detect movement. Also the fallback
-    /// target while the cursor is outside the window (LÖVE always reports
-    /// a position; Bevy doesn't).
+    /// Previous frame's pointer, to detect movement (LÖVE always reports
+    /// a position; Bevy doesn't — while the cursor is out of the window
+    /// the fish grazes for the food instead; see [`drive_fish`]).
     last_mouse: Option<Vec2>,
 }
 
@@ -306,6 +309,22 @@ const SCHOOL_EDGE_MARGIN: f32 = 5.0;
 /// off, snatch it, and rejoin — see `school_stays_steerable_away_from_food`).
 const SCHOOL_FOOD_K: f32 = 10.0;
 const SCHOOL_FOOD_NEAR: f32 = 100.0;
+/// Grazing — the pointer-out-of-the-window mode: the school hunts the
+/// food itself. Beyond [`SCHOOL_FOOD_NEAR`] the food takes over the
+/// mouse's far-field role (attract [`SCHOOL_MOUSE_ATTRACT_K`], no repel
+/// ring), and on approach the desired speed is capped at
+/// `SCHOOL_GRAZE_BRAKE · distance`. The cap is what guarantees the eat:
+/// the slew limiter gives every fish a minimum turn radius of
+/// `speed / SCHOOL_TURN_RATE` (64 px at the default 320 — over three
+/// times the 20 px eat radius), and a turn-limited pursuer chasing a
+/// point it cannot out-turn settles into a STABLE circle at exactly that
+/// radius — observed live as "the school orbits the food forever". With
+/// the cap, holding a circle of radius d needs an orbital rate of at
+/// most `0.8 · SCHOOL_TURN_RATE` — strictly below the turn rate at every
+/// distance and every speed setting — so the circle contracts all the
+/// way in: fish brake as they strike, eat, and the respawned food
+/// releases them at full speed.
+const SCHOOL_GRAZE_BRAKE: f32 = 0.8 * SCHOOL_TURN_RATE;
 /// Smoothing — our deliberate fix on top of the Lua rules, in two
 /// layers. The original's forces routinely exceed the speed cap *per
 /// frame*: the mouse force alone is bang-bang at the 50 px ring (attract
@@ -444,10 +463,6 @@ pub struct School {
     /// the calm blend can leave it at full strength (see [`Self::step`]);
     /// sized lazily by `step`, since only it reads them together.
     acc_food: Vec<Vec2>,
-    /// The school's own pointer memory for cursor-left-the-window frames.
-    /// Never [`FishGame::last_mouse`] — that one belongs to the single
-    /// fish's moved/circling logic, which a count flip must not disturb.
-    last_mouse: Option<Vec2>,
     /// Last frame's pointer + how long it has rested, for the calm ramp.
     idle_mouse: Option<Vec2>,
     idle_secs: f32,
@@ -475,6 +490,7 @@ fn school_steer(
     i: usize,
     mouse: Option<Vec2>,
     food: Option<Vec2>,
+    graze: bool,
     settings: &FishSettings,
     frame: u32,
 ) -> (Vec2, Vec2) {
@@ -555,10 +571,14 @@ fn school_steer(
         acc += school_target_force(settings.cohesion, cohere, v, max_speed);
     }
     let mut acc_food = Vec2::ZERO;
-    if let Some(f) = food
-        && p.distance(f) < SCHOOL_FOOD_NEAR
-    {
-        acc_food = school_target_force(SCHOOL_FOOD_K, f - p, v, max_speed);
+    if let Some(f) = food {
+        if p.distance(f) < SCHOOL_FOOD_NEAR {
+            acc_food = school_target_force(SCHOOL_FOOD_K, f - p, v, max_speed);
+        } else if graze {
+            // Grazing: with no pointer to chase, the food takes over the
+            // mouse's far-field role — same attract k, no repel ring.
+            acc_food = school_target_force(SCHOOL_MOUSE_ATTRACT_K, f - p, v, max_speed);
+        }
     }
     if let Some(m) = mouse {
         let k = if p.distance(m) >= SCHOOL_MOUSE_NEAR {
@@ -590,19 +610,24 @@ impl School {
     /// `guide` + `update` two-pass structure, force order included
     /// (flocking, then the optional target, then the mouse). `mouse` is
     /// the resolved pointer (None = no mouse steering), `food` the homing
-    /// target (None in pure-school parity tests); velocities are px/s,
-    /// max speed and the steering weights come from `settings`. `calm`
-    /// is the idle-pointer blend from [`Self::idle_calm`], and `smooth`
-    /// runs every velocity through the [`school_slew`] limiter — the
-    /// shipped game always passes true; the parity tests pass false
-    /// (and calm 0), which is exactly the Lua integration.
-    /// The accel pass is chunked across the compute pool — each boid's
-    /// forces read only the frozen snapshot, so the result is identical
-    /// to the serial pass regardless of thread count.
+    /// target (None in pure-school parity tests), `graze` the
+    /// pointer-out-of-the-window mode ([`SCHOOL_GRAZE_BRAKE`]: the food
+    /// attracts from afar and the approach speed brakes — the in-window
+    /// paths and the parity tests pass false, leaving them untouched);
+    /// velocities are px/s, max speed and the steering weights come from
+    /// `settings`. `calm` is the idle-pointer blend from
+    /// [`Self::idle_calm`], and `smooth` runs every velocity through the
+    /// [`school_slew`] limiter — the shipped game always passes true;
+    /// the parity tests pass false (and calm 0), which is exactly the
+    /// Lua integration. The accel pass is chunked across the compute
+    /// pool — each boid's forces read only the frozen snapshot, so the
+    /// result is identical to the serial pass regardless of thread count.
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
         mouse: Option<Vec2>,
         food: Option<Vec2>,
+        graze: bool,
         settings: &FishSettings,
         calm: f32,
         smooth: bool,
@@ -642,8 +667,17 @@ impl School {
                     let base = c * chunk_size;
                     for (k, (a, af)) in acc_chunk.iter_mut().zip(food_chunk.iter_mut()).enumerate()
                     {
-                        (*a, *af) =
-                            school_steer(pos, vel, grid, base + k, mouse, food, settings, frame);
+                        (*a, *af) = school_steer(
+                            pos,
+                            vel,
+                            grid,
+                            base + k,
+                            mouse,
+                            food,
+                            graze,
+                            settings,
+                            frame,
+                        );
                     }
                 });
             }
@@ -687,7 +721,16 @@ impl School {
                 let mill = tangent * mill_speed + r_hat * radial;
                 (base.lerp(mill, c) + dv_food).clamp_length_max(max_speed)
             } else {
-                (self.vel[i] + dv_school + dv_food).clamp_length_max(max_speed)
+                let raw = (self.vel[i] + dv_school + dv_food).clamp_length_max(max_speed);
+                match food {
+                    // Grazing: brake toward the strike, or the slew
+                    // limiter's turn-radius floor parks the school on a
+                    // permanent orbit (see [`SCHOOL_GRAZE_BRAKE`]).
+                    Some(f) if graze => {
+                        raw.clamp_length_max(SCHOOL_GRAZE_BRAKE * self.pos[i].distance(f))
+                    }
+                    _ => raw,
+                }
             };
             let v = if smooth {
                 school_slew(self.vel[i], target, dt)
@@ -820,7 +863,6 @@ fn handle_restart(
     school.vel.clear();
     school.acc.clear();
     school.acc_food.clear();
-    school.last_mouse = None;
     school.idle_mouse = None;
     school.idle_secs = 0.0;
     for _ in 0..count {
@@ -861,6 +903,7 @@ fn drive_school(
     settings: &FishSettings,
     bounds: Vec2,
     mouse: Option<Vec2>,
+    graze: bool,
     dt: f32,
     rng: &mut impl Rng,
 ) {
@@ -891,7 +934,7 @@ fn drive_school(
     // The calm blend ramps in while the pointer rests (zero otherwise);
     // the slew limiter is always on — the shipped school never snaps.
     let calm = school.idle_calm(mouse, dt);
-    school.step(mouse, Some(game.food), settings, calm, true, dt);
+    school.step(mouse, Some(game.food), graze, settings, calm, true, dt);
 
     // Every spine rides its boid: the position is the centerline, the
     // velocity the wave direction; the head is never written back (the
@@ -956,28 +999,32 @@ fn drive_fish(
 
     if fishes.0.len() > 1 {
         // The school's pointer. LÖVE always has a concrete position;
-        // Bevy doesn't: perf pins aim at the centre, windowed runs fall
-        // back to the last known spot and then the centre (the menu
-        // backdrop must not let the school drift off-screen), headless
-        // unpinned runs have none at all — pure flocking, the spread
-        // perf case. The original's guards then apply to the resolved
-        // point: no chasing while the pointer drives the UI (the school
-        // respects it, unlike the single fish — each faithful to its
-        // original) or rests within 5 px of a window edge.
-        let mouse = if pinned.0 {
-            Some(centre)
+        // Bevy doesn't: perf pins aim at the centre; with the cursor in
+        // the window the original's guards apply to it untouched — no
+        // chasing while the pointer drives the UI (the school respects
+        // it, unlike the single fish — each faithful to its original) or
+        // rests within 5 px of a window edge. With the cursor GONE the
+        // school grazes instead: no pointer at all, and the food becomes
+        // the attractor the player stopped providing (which also keeps
+        // the menu backdrop on screen) — it pulls from afar with the
+        // mouse's own attract k but no repel ring, and the approach
+        // brakes so the eat actually lands ([`SCHOOL_GRAZE_BRAKE`]).
+        // Headless unpinned runs have no window at all — graze stays
+        // off: pure flocking, the spread perf case stays measurable.
+        let (mouse, graze) = if pinned.0 {
+            (Some(centre), false)
         } else if let Ok(window) = window.single() {
-            let resolved = window
-                .cursor_position()
-                .or(school.last_mouse)
-                .unwrap_or(centre);
-            school.last_mouse = Some(resolved);
-            let margin = Vec2::splat(SCHOOL_EDGE_MARGIN);
-            let inside =
-                resolved.cmpgt(margin).all() && resolved.cmplt(bounds.0 - margin).all();
-            (!over_ui.0 && inside).then_some(resolved)
+            match window.cursor_position() {
+                Some(cursor) => {
+                    let margin = Vec2::splat(SCHOOL_EDGE_MARGIN);
+                    let inside =
+                        cursor.cmpgt(margin).all() && cursor.cmplt(bounds.0 - margin).all();
+                    ((!over_ui.0 && inside).then_some(cursor), false)
+                }
+                None => (None, true),
+            }
         } else {
-            None
+            (None, false)
         };
         drive_school(
             &mut fishes.0,
@@ -986,6 +1033,7 @@ fn drive_fish(
             &settings,
             bounds.0,
             mouse,
+            graze,
             dt,
             &mut rand::rng(),
         );
@@ -1023,15 +1071,26 @@ fn drive_fish(
         }
     }
 
-    // When the pointer is still and the fish has reached it, orbit it in a
-    // small circle instead of stopping on top of it. The cursor can leave
-    // the window in Bevy; keep targeting its last known spot then.
-    let mouse = window
+    // The cursor can leave the window in Bevy (LÖVE always reports a
+    // position). With nobody to follow, the fish helps itself: swim
+    // straight for the food — eating respawns it afar, so an unattended
+    // fish grazes from food to food until the pointer returns. The orbit
+    // state resets so re-entry starts a plain chase, exactly like a
+    // moved pointer; `last_mouse` keeps the pre-departure spot for the
+    // `moved` check on return.
+    let Some(mouse) = window
         .single()
         .ok()
         .and_then(|window| window.cursor_position())
-        .or(game.last_mouse)
-        .unwrap_or(centre);
+    else {
+        game.circling = false;
+        fish.set_target_at_speed(game.food, dt);
+        fish.update(dt);
+        return;
+    };
+
+    // When the pointer is still and the fish has reached it, orbit it in a
+    // small circle instead of stopping on top of it.
     let moved = game
         .last_mouse
         .is_some_and(|last| (mouse - last).length() > 0.5);
@@ -1255,7 +1314,7 @@ mod tests {
         let truth = school_truth_frames();
         let mut school = lua_school_init();
         for frame in &truth[..5] {
-            school.step(SCHOOL_MOUSE, None, &lua_settings(), 0.0, false, 1.0 / 60.0);
+            school.step(SCHOOL_MOUSE, None, false, &lua_settings(), 0.0, false, 1.0 / 60.0);
             for (i, (pos, _)) in frame.iter().enumerate() {
                 let d = school.pos[i].distance(*pos);
                 assert!(d < 1e-2, "boid {i}: {} vs Lua {pos} (off {d})", school.pos[i]);
@@ -1283,7 +1342,7 @@ mod tests {
                     ..Default::default()
                 }
             };
-            school.step(SCHOOL_MOUSE, None, &lua_settings(), 0.0, false, 1.0 / 60.0);
+            school.step(SCHOOL_MOUSE, None, false, &lua_settings(), 0.0, false, 1.0 / 60.0);
             for (i, (pos, vel)) in truth[f].iter().enumerate() {
                 let dp = school.pos[i].distance(*pos);
                 let dv = school.vel[i].distance(*vel);
@@ -1340,6 +1399,7 @@ mod tests {
             &settings,
             bounds,
             None,
+            false,
             1.0 / 60.0,
             &mut rng,
         );
@@ -1435,6 +1495,7 @@ mod tests {
                     &settings,
                     bounds,
                     Some(food), // cursor parked exactly on the food
+                    false,
                     1.0 / 60.0,
                     &mut rng,
                 );
@@ -1487,6 +1548,7 @@ mod tests {
                 &settings,
                 bounds,
                 Some(mouse),
+                false,
                 1.0 / 60.0,
                 &mut rng,
             );
@@ -1516,7 +1578,7 @@ mod tests {
         let step_with = |settings: &FishSettings| {
             let mut school = init();
             // Lua-exact path (no slew): this test pins the force wiring.
-            school.step(None, None, settings, 0.0, false, 1.0 / 60.0);
+            school.step(None, None, false, settings, 0.0, false, 1.0 / 60.0);
             (school.pos[0], school.pos[1])
         };
 
@@ -1582,7 +1644,8 @@ mod tests {
         };
         let mut drive = |school: &mut School, fishes: &mut [Fish], game: &mut FishGame| {
             drive_school(
-                fishes, school, game, &settings, bounds, Some(mouse), 1.0 / 60.0, &mut rng,
+                fishes, school, game, &settings, bounds, Some(mouse), false, 1.0 / 60.0,
+                &mut rng,
             );
         };
         // Let the calm ramp in (delay 0.25s + ramp 0.75s) and settle.
@@ -1666,6 +1729,7 @@ mod tests {
                 &settings,
                 bounds,
                 Some(mouse),
+                false,
                 dt,
                 &mut rng,
             );
@@ -1686,6 +1750,69 @@ mod tests {
             }
         }
         assert!(game.eaten > 0, "the blob sat on food territory yet never ate");
+    }
+
+    /// Grazing (pointer away) must actually eat. The deadlock this pins:
+    /// the slew limiter gives every fish a minimum turn radius of
+    /// speed/[`SCHOOL_TURN_RATE`], and a turn-limited pursuer chasing a
+    /// point it cannot out-turn settles on a STABLE circle at that
+    /// radius — over three times the 20 px eat radius at the default
+    /// speed (observed live: the school orbited the food forever).
+    /// Start the school ON that circle, tangential at full speed — the
+    /// stuck state itself — at the default speed and the slider max;
+    /// [`SCHOOL_GRAZE_BRAKE`] must contract the orbit into an eat.
+    #[test]
+    fn grazing_school_breaks_the_orbit_and_eats() {
+        let _ = bevy::tasks::ComputeTaskPool::get_or_init(Default::default);
+        let mut rng = rand::rng();
+        let bounds = Vec2::new(1280.0, 800.0);
+        let food = Vec2::new(640.0, 400.0);
+        for speed in [320.0f32, 900.0] {
+            let settings = FishSettings {
+                speed,
+                ..Default::default()
+            };
+            let radius = speed / SCHOOL_TURN_RATE;
+            let mut fishes = Vec::new();
+            let mut school = School::default();
+            for i in 0..5usize {
+                let a = i as f32 * (TAU / 5.0);
+                let origin = food + Vec2::from_angle(a) * radius;
+                let mut fish = Fish::new(origin, settings.start_scale, speed, &mut rng);
+                fish.update(0.0);
+                fishes.push(fish);
+                school.pos.push(origin);
+                school.vel.push(Vec2::from_angle(a + PI / 2.0) * speed);
+                school.acc.push(Vec2::ZERO);
+            }
+            let mut game = FishGame {
+                food,
+                orbit_dir: 1.0,
+                ..Default::default()
+            };
+            let mut ate = false;
+            for _ in 0..900 {
+                drive_school(
+                    &mut fishes,
+                    &mut school,
+                    &mut game,
+                    &settings,
+                    bounds,
+                    None,
+                    true, // grazing: the pointer is out of the window
+                    1.0 / 60.0,
+                    &mut rng,
+                );
+                if game.eaten > 0 {
+                    ate = true;
+                    break;
+                }
+            }
+            assert!(
+                ate,
+                "grazing school at speed {speed} kept orbiting the food (radius {radius})"
+            );
+        }
     }
 
     /// A moving pointer never engages the calm regime — the chase stays
@@ -1734,5 +1861,120 @@ mod tests {
         let expected = 15.0 * (0.1f32 * 4.5).sin();
         assert!((fish.spine.target.y - expected).abs() < 1e-4);
         assert!((fish.spine.target.x - 50.0).abs() < 1e-4);
+    }
+
+    // -----------------------------------------------------------------
+    // The pointer-resolution layer: graze for the food while the cursor
+    // is out of the window, the original behaviour the moment it is back.
+    // Only the real `drive_fish` system sees the window, so these drive
+    // it in a headless App with a scripted cursor.
+
+    /// Bounds matching the default test `Window` resolution.
+    const POINTER_BOUNDS: Vec2 = Vec2::new(1280.0, 720.0);
+
+    fn pointer_app(settings: FishSettings, food: Vec2) -> App {
+        let _ = bevy::tasks::ComputeTaskPool::get_or_init(Default::default);
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(settings)
+            .insert_resource(SimBounds(POINTER_BOUNDS))
+            .insert_resource(PinnedAttractor(false))
+            .insert_resource(PointerOverUi(false))
+            .init_resource::<Fishes>()
+            .init_resource::<School>()
+            .insert_resource(FishGame {
+                food,
+                orbit_dir: 1.0,
+                ..Default::default()
+            })
+            .add_systems(Update, drive_fish);
+        // A fresh `Window` reports no cursor — the pointer starts "away".
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app
+    }
+
+    fn pointer_frame(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_micros(16_667));
+        app.update();
+    }
+
+    fn set_cursor(app: &mut App, pos: Vec2) {
+        let mut windows = app
+            .world_mut()
+            .query_filtered::<&mut Window, With<PrimaryWindow>>();
+        windows
+            .single_mut(app.world_mut())
+            .unwrap()
+            .set_physical_cursor_position(Some(bevy::math::DVec2::new(
+                pos.x as f64,
+                pos.y as f64,
+            )));
+    }
+
+    /// An unattended lone fish feeds itself, and the original chase—orbit
+    /// rules take back over the moment the pointer returns.
+    #[test]
+    fn lone_fish_grazes_while_the_pointer_is_away() {
+        let settings = FishSettings {
+            count: 1.0,
+            speed: 400.0,
+            ..Default::default()
+        };
+        let mut app = pointer_app(settings, Vec2::new(300.0, 300.0));
+        let mut ate = false;
+        for _ in 0..900 {
+            pointer_frame(&mut app);
+            if app.world().resource::<FishGame>().eaten > 0 {
+                ate = true;
+                break;
+            }
+        }
+        assert!(ate, "an unattended fish never grazed its way to the food");
+
+        // The pointer returns, still: the fish must reach it and engage
+        // the orbit — the in-window behaviour, food ignored beyond eats.
+        let mouse = Vec2::new(900.0, 360.0);
+        set_cursor(&mut app, mouse);
+        for _ in 0..600 {
+            pointer_frame(&mut app);
+        }
+        let game = app.world().resource::<FishGame>();
+        assert!(game.circling, "a still pointer, reached: the orbit never engaged");
+        let fishes = app.world().resource::<Fishes>();
+        let d = fishes.0[0].base_target.unwrap().distance(mouse);
+        assert!(d < 160.0, "fish settled {d} px from the returned pointer");
+    }
+
+    /// An unattended school herds itself to the food (the proven parked-
+    /// cursor regime), and follows a returned pointer away from it.
+    #[test]
+    fn school_goes_for_the_food_while_the_pointer_is_away() {
+        // The shipped opening: the default 5 fish.
+        let mut app = pointer_app(FishSettings::default(), Vec2::new(1000.0, 560.0));
+        let mut ate = false;
+        for _ in 0..1800 {
+            pointer_frame(&mut app);
+            if app.world().resource::<FishGame>().eaten > 0 {
+                ate = true;
+                break;
+            }
+        }
+        assert!(ate, "an unattended school never reached the food in 30 simulated seconds");
+
+        // The pointer returns far from the food: the school must follow
+        // it there — the in-window behaviour is the original's.
+        let mouse = Vec2::new(200.0, 150.0);
+        set_cursor(&mut app, mouse);
+        for _ in 0..600 {
+            pointer_frame(&mut app);
+        }
+        let school = app.world().resource::<School>();
+        let centroid = school.pos.iter().sum::<Vec2>() / school.pos.len() as f32;
+        assert!(
+            centroid.distance(mouse) < 300.0,
+            "school ignored the returned pointer: centroid {centroid}"
+        );
     }
 }

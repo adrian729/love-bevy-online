@@ -1,6 +1,8 @@
 //! Live-tunable fish settings, matching `tunables` / `tunableSpecs` in
 //! `minigames/fish.lua` — plus the fish count, which the original kept in
-//! a separate "school" minigame and we fold in as one more tunable. Speed,
+//! a separate "school" minigame and we fold in as one more tunable (the
+//! count and speed *defaults* deviate: 5 fish at 320 instead of the
+//! original's lone fish at 200). Speed,
 //! the wave knobs, and the count apply live; start size and growth apply
 //! from the next restart (growth changes the running fish's future
 //! growth, not its current size — like the original).
@@ -26,8 +28,11 @@ pub struct FishSettings {
 impl Default for FishSettings {
     fn default() -> Self {
         Self {
-            count: 1.0,
-            speed: 200.0,
+            // Open with a small school already in motion, a touch quicker
+            // than the original's lone fish at 200 — a deliberate default
+            // change (the parity tests pin speed explicitly).
+            count: 5.0,
+            speed: 320.0,
             start_scale: 0.05,
             growth_rate: 0.01,
             // The school minigame's steering-weight defaults (lib/school.lua).

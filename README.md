@@ -228,6 +228,14 @@ Deliberate differences:
   stationary-pointer orbit, schooled. Pointer movement releases the
   mill instantly, and the food pull rides outside it, so a milling
   school still dives and eats.
+- While the pointer is out of the window, fish go for the food instead —
+  the lone fish grazes from food to food, the school herds itself onto
+  it and brakes as it strikes so the eat actually lands (at full speed a
+  turn-rate-limited fish can never out-turn a point target: uncapped, it
+  orbits the food forever). A situation LÖVE could never observe: its
+  cursor always reports a position. The moment the pointer is back, the
+  original rules apply untouched. The fish experiment also opens with
+  5 fish at speed 320 (the original's defaults were one fish at 200).
 - The flow field is deliberately *better* than the original rather than
   1:1 (the rest of its tunables, palettes, and view modes are the
   original's). The original samples the nearest grid cell (trajectories
