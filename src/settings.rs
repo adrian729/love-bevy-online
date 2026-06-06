@@ -72,9 +72,10 @@ impl Param {
 
     pub fn range(self) -> (f32, f32) {
         match self {
-            // 2x the ~5k the sim comfortably runs at 60 fps (release, M4 Pro).
-            // The LÖVE original capped at 300 for browser performance.
-            Self::Count => (10.0, 10_000.0),
+            // With the neighbour-sampling cap the sim cost is linear in n;
+            // 20k measured at ~120 fps (release, M4 Pro). The LÖVE original
+            // capped at 300 for browser performance.
+            Self::Count => (10.0, 20_000.0),
             Self::Speed => (50.0, 1500.0),
             Self::Separation => (0.0, 8.0),
             Self::Alignment => (0.0, 6.0),
@@ -171,10 +172,10 @@ mod tests {
     }
 
     /// The log scale exists to keep small flocks draggable: half the track
-    /// should cover counts up to a few hundred, not up to 5000.
+    /// should cover counts up to a few hundred, not up to half the max.
     #[test]
     fn count_log_scale_keeps_low_end_usable() {
         let mid = Param::Count.value_from_t(0.5);
-        assert!((200.0..400.0).contains(&mid), "track midpoint = {mid}");
+        assert!((100.0..600.0).contains(&mid), "track midpoint = {mid}");
     }
 }

@@ -174,6 +174,17 @@ fn target_force(k: f32, dir: Vec2, vel: Vec2, max_speed: f32) -> Vec2 {
     k * steer.clamp_length_max(MAX_FORCE) * REF_FPS * REF_FPS
 }
 
+/// Per-boid cap on neighbour candidates examined per frame. When the whole
+/// flock piles onto the cursor, every boid has thousands of in-radius
+/// neighbours and the per-neighbour rules degenerate to O(n²) — at the 10k
+/// slider max that's ~10⁸ distance checks a frame. Above this cap we stride-
+/// sample the 3x3 candidate cells instead: all three steering forces only use
+/// the *direction* of the neighbour aggregate (`target_force` normalizes it),
+/// so a few hundred uniform samples give a statistically identical answer.
+/// With at most this many candidates the scan is exhaustive and exact, which
+/// covers the LÖVE original's entire 10–300 range — parity is preserved.
+const MAX_NEIGHBOUR_SAMPLES: usize = 512;
+
 fn flocking(
     time: Res<Time>,
     settings: Res<SimSettings>,
@@ -214,6 +225,10 @@ fn flocking(
         grid.entry(cell(*p)).or_default().push(i);
     }
 
+    // Salt the sampling offset per frame so any residual sampling bias
+    // dithers away over time instead of pushing steadily in one direction.
+    let frame_salt = time.elapsed().as_millis() as usize;
+
     // Steer + integrate every boid in parallel on the compute task pool; the
     // snapshot and grid are read-only, each boid only writes its own state.
     boids.par_iter_mut().for_each(|(entity, mut tf, mut vel)| {
@@ -226,30 +241,53 @@ fn flocking(
         let mut n_align = 0u32;
         let mut n_avoid = 0u32;
 
+        // Gather the 3x3 candidate cells, then visit every candidate while
+        // they fit the sample budget, or an unbiased every-`stride`-th
+        // otherwise (see MAX_NEIGHBOUR_SAMPLES).
         let home = cell(p);
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let Some(bucket) = grid.get(&(home + IVec2::new(dx, dy))) else {
+        let mut buckets: [&[usize]; 9] = [&[]; 9];
+        let mut candidates = 0usize;
+        for (slot, (dy, dx)) in (-1..=1)
+            .flat_map(|dy| (-1..=1).map(move |dx| (dy, dx)))
+            .enumerate()
+        {
+            if let Some(bucket) = grid.get(&(home + IVec2::new(dx, dy))) {
+                buckets[slot] = bucket;
+                candidates += bucket.len();
+            }
+        }
+        let stride = candidates.div_ceil(MAX_NEIGHBOUR_SAMPLES).max(1);
+        let offset = (entity.index().index() as usize)
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(frame_salt)
+            % stride;
+
+        // Step directly from sample to sample — the loop must be O(samples),
+        // not O(candidates), or dense flocks still pay per-candidate cost.
+        let mut base = 0usize; // global candidate index where this bucket starts
+        for bucket in buckets {
+            // First local index whose global index ≡ offset (mod stride).
+            let mut i = (offset + stride - base % stride) % stride;
+            while i < bucket.len() {
+                let j = bucket[i];
+                i += stride;
+                let (other, pj, vj) = flock[j];
+                if other == entity {
                     continue;
-                };
-                for &j in bucket {
-                    let (other, pj, vj) = flock[j];
-                    if other == entity {
-                        continue;
-                    }
-                    let d = p.distance(pj);
-                    if d > 0.0 && d < NEIGHBOUR_DIST {
-                        sum_align += vj;
-                        sum_cohere += pj;
-                        n_align += 1;
-                    }
-                    if d > 0.0 && d < SEPARATE_DIST {
-                        // Weighted away-vector, falling off with distance.
-                        sum_separate += (p - pj).normalize_or_zero() / d;
-                        n_avoid += 1;
-                    }
+                }
+                let d = p.distance(pj);
+                if d > 0.0 && d < NEIGHBOUR_DIST {
+                    sum_align += vj;
+                    sum_cohere += pj;
+                    n_align += 1;
+                }
+                if d > 0.0 && d < SEPARATE_DIST {
+                    // Weighted away-vector, falling off with distance.
+                    sum_separate += (p - pj).normalize_or_zero() / d;
+                    n_avoid += 1;
                 }
             }
+            base += bucket.len();
         }
 
         let mut acc = Vec2::ZERO;

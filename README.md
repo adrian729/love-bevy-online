@@ -22,7 +22,7 @@ cargo run --release  # optimized build
 
 | Setting | Range | Default | |
 |---|---|---|---|
-| Boids | 10 – 10,000 | 50 | log-scale slider; the LÖVE original capped at 300 |
+| Boids | 10 – 20,000 | 50 | log-scale slider; the LÖVE original capped at 300 |
 | Speed | 50 – 1500 | 400 | |
 | Separation | 0 – 8 | 1.8 | |
 | Alignment | 0 – 6 | 1.0 | |
@@ -34,9 +34,18 @@ All apply live, including the boid count (the flock grows/shrinks on the fly).
 
 Steering runs in parallel on the compute task pool (`Query::par_iter_mut`
 against a frame-start snapshot + spatial hash). Measured on an M4 Pro,
-release build: **10,000 boids at ~120 fps (vsync-limited)**. Worst case is
-boids piling into one grid cell (e.g. parked on the cursor), which degrades
-toward O(n²) — softened by the parallelism, same behaviour as the original.
+release build: **10,000 boids at ~120 fps (vsync-limited)**, **20,000 at
+~85–95 fps**, and **~100–115 fps sustained with all 20,000 held in a ring on
+a pinned attractor** (the worst case — the whole flock parked on the cursor;
+neighbour sampling bounds it, see below). Past ~20k the cost is per-entity
+overhead (transform propagation, extraction, batching), which grows linearly;
+the next big jump would be a GPU-compute sim.
+
+The worst case is bounded by neighbour sampling: each boid examines at most
+512 candidates per frame, stride-sampled across its 3x3 cells. Steering only
+uses the *direction* of the neighbour aggregate, so the sample is
+statistically unbiased; with ≤512 candidates the scan is exhaustive and
+bit-for-bit exact, which covers the original's entire 10–300 range.
 
 Perf-test mode — pass an initial count and fps prints to stdout once a second:
 
