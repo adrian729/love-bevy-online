@@ -68,7 +68,9 @@ struct FishVertex {
 struct Palette {
     body: [u8; 4],
     fin: [u8; 4],
-    food: [u8; 4],
+    /// Flake-food tones: the original's amber plus an orange and a
+    /// toasted brown, like a pinch from a tub of fish flakes.
+    flakes: [[u8; 4]; 3],
     white: [u8; 4],
     eye: [u8; 4],
     pupil: [u8; 4],
@@ -89,7 +91,11 @@ fn palette() -> &'static Palette {
     PALETTE.get_or_init(|| Palette {
         body: linear_u8(58.0 / 255.0, 124.0 / 255.0, 165.0 / 255.0),
         fin: linear_u8(129.0 / 255.0, 195.0 / 255.0, 215.0 / 255.0),
-        food: linear_u8(219.0 / 255.0, 182.0 / 255.0, 0.0),
+        flakes: [
+            linear_u8(219.0 / 255.0, 182.0 / 255.0, 0.0),
+            linear_u8(228.0 / 255.0, 134.0 / 255.0, 36.0 / 255.0),
+            linear_u8(178.0 / 255.0, 98.0 / 255.0, 30.0 / 255.0),
+        ],
         white: [255, 255, 255, 255],
         eye: linear_u8(0.7, 0.7, 0.7),
         pupil: linear_u8(0.05, 0.05, 0.05),
@@ -166,13 +172,12 @@ fn rebuild_geometry(
     let origin = bounds.0 / 2.0;
     emitter.clear(origin);
 
-    // The food dot draws first (minigames/fish.lua draw order). Any fish
-    // can eat it — one or a whole school — so its radius tracks the
-    // biggest fish (identical to the original with a single fish).
+    // The food draws first (minigames/fish.lua draw order). Any fish can
+    // eat it — one or a whole school — so its footprint tracks the
+    // biggest fish (the original dot's radius rule).
     if let Some(max_scale) = fishes.0.iter().map(|fish| fish.scale).reduce(f32::max) {
         let r = (max_scale * 20.0).min(10.0);
-        emitter.fill_circle(game.food, r, palette().food);
-        emitter.stroke_circle(game.food, r, palette().white);
+        emit_food(&mut emitter, game.food, r);
     }
 
     let count = fishes.0.len();
@@ -298,6 +303,46 @@ impl Scratch {
         // the body closes because its shape starts and ends at the nose
         // tip; the tail's base edge stays open, hidden under the body.
         emitter.stroke_polyline(&self.simplified, palette().white, false);
+    }
+}
+
+/// A pinch of flake food instead of the original's plain amber dot: a few
+/// small flat ellipses in warm tones scattered inside the old dot's
+/// footprint, the last few outlined white like everything else in the
+/// scene. The arrangement hashes off the drop position — stable while the
+/// food sits, fresh on every respawn.
+fn emit_food(emitter: &mut Emitter, center: Vec2, r: f32) {
+    // PCG hash seeded from the drop position's bits.
+    let mut state =
+        center.x.to_bits().wrapping_mul(0x9E37_79B9) ^ center.y.to_bits().rotate_left(16);
+    let mut rand = move || {
+        state = state.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+        let word = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277_803_737);
+        ((word >> 22) ^ word) as f32 * (1.0 / u32::MAX as f32)
+    };
+    // A tiny drop (the food starts at the smallest fish's footprint and
+    // grows with the school) can't fit a whole pinch — shed flakes as it
+    // shrinks, down to the original's single outlined dot.
+    let flakes = ((r * 0.6) as usize).clamp(1, 6);
+    let spin = rand() * TAU;
+    let mut pinch = [(Vec2::ZERO, 0.0, 0.0, 0.0); 6];
+    for (i, flake) in pinch.iter_mut().enumerate().take(flakes) {
+        // Stratified angles so the pinch spreads instead of clumping.
+        let angle = spin + (i as f32 + 0.7 * rand()) * (TAU / flakes as f32);
+        let dist = r * (0.15 + 0.47 * rand());
+        let pos = center + dist * Vec2::from_angle(angle);
+        let rx = r * (0.26 + 0.14 * rand());
+        let ry = rx * (0.55 + 0.30 * rand());
+        let rot = rand() * TAU;
+        let tone = palette().flakes[(rand() * 3.0) as usize % 3];
+        *flake = (pos, rx, ry, rot);
+        emitter.fill_ellipse(pos, rx, ry, rot, tone);
+    }
+    // Linework over the colour, like the rest of the scene — but only on
+    // every other flake: a white ring on all of them in a 20-px pinch
+    // would read as scribble.
+    for &(pos, rx, ry, rot) in pinch.iter().take(flakes).step_by(2) {
+        emitter.stroke_ellipse(pos, rx, ry, rot, palette().white);
     }
 }
 
@@ -692,10 +737,6 @@ impl Emitter {
 
     fn fill_circle(&mut self, center: Vec2, r: f32, color: [u8; 4]) {
         self.fill_ellipse(center, r, r, 0.0, color);
-    }
-
-    fn stroke_circle(&mut self, center: Vec2, r: f32, color: [u8; 4]) {
-        self.stroke_ellipse(center, r, r, 0.0, color);
     }
 
     fn fill_ellipse(&mut self, center: Vec2, rx: f32, ry: f32, rot: f32, color: [u8; 4]) {

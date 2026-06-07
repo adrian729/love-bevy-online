@@ -293,8 +293,8 @@ pub fn plugin(app: &mut App) {
     if std::env::args().skip(1).any(|arg| arg == "glossy") {
         settings.style = WaterStyle::Glossy;
     }
-    // Water probe overrides (the flow CLI's `key=value` convention):
-    // `ripple=3 caustics=0.2 sparkle=1` — tuning/perf probes only.
+    // Probe overrides (the flow CLI's `key=value` convention):
+    // `ripple=3 caustics=0.2 sparkle=1 scale=0.5` — tuning/perf probes only.
     for arg in std::env::args().skip(1) {
         if let Some((key, value)) = arg.split_once('=')
             && let Ok(value) = value.parse::<f32>()
@@ -304,6 +304,7 @@ pub fn plugin(app: &mut App) {
                 "caustics" => settings.caustics = value,
                 "sparkle" => settings.sparkle = value,
                 "bubbles" => settings.bubble_count = value,
+                "scale" => settings.start_scale = value,
                 _ => {}
             }
         }

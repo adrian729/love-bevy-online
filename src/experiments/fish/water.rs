@@ -1759,7 +1759,8 @@ fn hash22(p: vec2<f32>) -> vec2<f32> {
 
 // Hand-placed flat twinkles: the window is cut into coarse cells, each on
 // its own clock; when a cell's turn comes up (the Sparkle dial sets how
-// often) it shows a small flat diamond at a re-rolled spot for a beat.
+// often) it shows a small flat diamond at a re-rolled spot and size for a
+// beat.
 fn twinkle(p: vec2<f32>, t: f32, density: f32) -> f32 {
     let cellp = p / 56.0;
     let id = floor(cellp);
@@ -1771,8 +1772,10 @@ fn twinkle(p: vec2<f32>, t: f32, density: f32) -> f32 {
     let lit = step(1.0 - 0.22 * density, h);
     let held = step(abs(phase - 0.5), 0.32);
     let pos = id + vec2<f32>(0.2) + 0.6 * hash22(id + vec2<f32>(bucket * 31.7, bucket * 17.3));
+    // Each appearance rolls its own size; the old fixed size is the cap.
+    let size = mix(0.45, 1.0, hash21(id + vec2<f32>(bucket * 7.9, bucket * 23.1)));
     let dd = cellp - pos;
-    let star = 1.0 - smoothstep(0.10, 0.16, abs(dd.x) + abs(dd.y));
+    let star = 1.0 - smoothstep(0.10 * size, 0.16 * size, abs(dd.x) + abs(dd.y));
     return lit * held * star;
 }
 
