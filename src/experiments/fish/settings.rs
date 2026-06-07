@@ -23,6 +23,16 @@ pub struct FishSettings {
     pub wave: bool,       // swim in a sine path instead of straight to the cursor
     pub wave_freq: f32,   // wiggles per second
     pub wave_amp: f32,    // lateral wiggle size (px)
+    // The pond (water.rs) — render-only, no original to be faithful to.
+    // Top-down framing: caustics live on the pond bed, ripples and
+    // sparkle on the surface, bubbles rise toward the camera.
+    pub water: bool,           // the whole water layer (bed + surface + bubbles)
+    pub caustics: f32,         // bed light-web intensity (0 = plain bed)
+    pub sparkle: f32,          // ambient surface sun-sparkle intensity
+    pub ripples: bool,         // fish wakes / food plops disturb the surface
+    pub ripple_strength: f32,  // how hard the fish churn the water
+    pub bubbles: bool,         // ambient bubbles rising to the surface
+    pub bubble_count: f32,     // how many bubbles cycle at once
 }
 
 impl Default for FishSettings {
@@ -42,6 +52,13 @@ impl Default for FishSettings {
             wave: true,
             wave_freq: 4.5,
             wave_amp: 15.0,
+            water: true,
+            caustics: 0.55,
+            sparkle: 0.35,
+            ripples: true,
+            ripple_strength: 0.5,
+            bubbles: true,
+            bubble_count: 128.0,
         }
     }
 }
@@ -60,6 +77,10 @@ pub enum FishParam {
     Cohesion,
     WaveFreq,
     WaveAmp,
+    Caustics,
+    Sparkle,
+    RippleStrength,
+    BubbleCount,
 }
 
 impl FishParam {
@@ -78,6 +99,11 @@ impl FishParam {
     /// Sliders only shown while the wiggle checkbox is on — the original's
     /// `visibleIf = 'wave'`.
     pub const WAVE: [Self; 2] = [Self::WaveFreq, Self::WaveAmp];
+    /// The water layer's always-relevant dials, shown while Water is on.
+    pub const WATER: [Self; 2] = [Self::Caustics, Self::Sparkle];
+    /// Shown while Water AND its sub-checkbox are on.
+    pub const RIPPLE: [Self; 1] = [Self::RippleStrength];
+    pub const BUBBLE: [Self; 1] = [Self::BubbleCount];
 }
 
 impl SliderBinding for FishParam {
@@ -94,6 +120,10 @@ impl SliderBinding for FishParam {
             Self::Cohesion => "Cohesion",
             Self::WaveFreq => "Wave freq",
             Self::WaveAmp => "Wave amp",
+            Self::Caustics => "Caustics",
+            Self::Sparkle => "Sparkle",
+            Self::RippleStrength => "Ripple strength",
+            Self::BubbleCount => "Bubble count",
         }
     }
 
@@ -110,6 +140,14 @@ impl SliderBinding for FishParam {
             Self::Alignment | Self::Cohesion => (0.0, 6.0),
             Self::WaveFreq => (1.0, 20.0),
             Self::WaveAmp => (5.0, 120.0),
+            // Pure shader dials: intensity multipliers, free at any value.
+            Self::Caustics | Self::Sparkle => (0.0, 1.0),
+            // Scales the CPU splat amplitude; the wave grid stays the
+            // same size, so cost is flat across the range.
+            Self::RippleStrength => (0.0, 3.0),
+            // Each bubble is one vertex-pull quad — 512 of them is ~3k
+            // vertices, nothing next to a single fish's outline.
+            Self::BubbleCount => (1.0, 512.0),
         }
     }
 
@@ -124,6 +162,10 @@ impl SliderBinding for FishParam {
             Self::Cohesion => s.cohesion,
             Self::WaveFreq => s.wave_freq,
             Self::WaveAmp => s.wave_amp,
+            Self::Caustics => s.caustics,
+            Self::Sparkle => s.sparkle,
+            Self::RippleStrength => s.ripple_strength,
+            Self::BubbleCount => s.bubble_count,
         }
     }
 
@@ -140,15 +182,28 @@ impl SliderBinding for FishParam {
             Self::Cohesion => s.cohesion = value,
             Self::WaveFreq => s.wave_freq = value,
             Self::WaveAmp => s.wave_amp = value,
+            Self::Caustics => s.caustics = value,
+            Self::Sparkle => s.sparkle = value,
+            Self::RippleStrength => s.ripple_strength = value,
+            Self::BubbleCount => s.bubble_count = value,
         }
     }
 
     /// The original's format strings: `%d`, `%.2f`, `%.3f`, `%.1f`, `%d`
-    /// (and the school's `%.2f` steering weights).
+    /// (and the school's `%.2f` steering weights; the water dials follow
+    /// the same conventions).
     fn format(self, value: f32) -> String {
         match self {
-            Self::Count | Self::Speed | Self::WaveAmp => format!("{}", value.round() as i32),
-            Self::StartScale | Self::Separation | Self::Alignment | Self::Cohesion => {
+            Self::Count | Self::Speed | Self::WaveAmp | Self::BubbleCount => {
+                format!("{}", value.round() as i32)
+            }
+            Self::StartScale
+            | Self::Separation
+            | Self::Alignment
+            | Self::Cohesion
+            | Self::Caustics
+            | Self::Sparkle
+            | Self::RippleStrength => {
                 format!("{value:.2}")
             }
             Self::GrowthRate => format!("{value:.3}"),
@@ -191,6 +246,26 @@ pub fn plugin(app: &mut App) {
     {
         settings.count = count;
     }
+    // Perf A/B switch: `nowater` measures the fish exactly as before the
+    // water layer existed (the water defaults on).
+    if std::env::args().skip(1).any(|arg| arg == "nowater") {
+        settings.water = false;
+    }
+    // Water probe overrides (the flow CLI's `key=value` convention):
+    // `ripple=3 caustics=0.2 sparkle=1` — tuning/perf probes only.
+    for arg in std::env::args().skip(1) {
+        if let Some((key, value)) = arg.split_once('=')
+            && let Ok(value) = value.parse::<f32>()
+        {
+            match key {
+                "ripple" => settings.ripple_strength = value,
+                "caustics" => settings.caustics = value,
+                "sparkle" => settings.sparkle = value,
+                "bubbles" => settings.bubble_count = value,
+                _ => {}
+            }
+        }
+    }
     app.insert_resource(settings);
 }
 
@@ -213,6 +288,10 @@ mod tests {
             FishParam::Cohesion,
             FishParam::WaveFreq,
             FishParam::WaveAmp,
+            FishParam::Caustics,
+            FishParam::Sparkle,
+            FishParam::RippleStrength,
+            FishParam::BubbleCount,
         ];
         let mut settings = FishSettings::default();
         for param in params {

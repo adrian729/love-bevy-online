@@ -7,6 +7,7 @@ pub mod render;
 pub mod settings;
 pub mod sim;
 pub mod ui;
+pub mod water;
 
 use bevy::prelude::*;
 
@@ -21,7 +22,7 @@ pub struct FishPlugin {
 
 impl Plugin for FishPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((settings::plugin, sim::plugin, render::plugin));
+        app.add_plugins((settings::plugin, sim::plugin, render::plugin, water::plugin));
         if !self.headless {
             app.add_plugins(ui::plugin);
         }

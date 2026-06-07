@@ -26,6 +26,8 @@ pub fn plugin(app: &mut App) {
             toggle_wave_checkbox,
             sync_wave_widgets,
             sync_school_rows,
+            toggle_water_checkboxes,
+            sync_water_widgets,
             (update_score, reset_settings).run_if(experiment_active(ExperimentId::Fish)),
         ),
     );
@@ -49,8 +51,47 @@ struct WaveRow;
 #[derive(Component)]
 struct SchoolRow;
 
-/// The fish's options-popup content: instructions, three sliders, the
-/// wiggle checkbox, and the wave sliders it reveals.
+/// The water layer's three checkboxes (water.rs) — the component doubles
+/// as the click target marker, like flow's FlowToggle.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum WaterToggle {
+    Water,
+    Ripples,
+    Bubbles,
+}
+
+/// A water checkbox's inner check mark, tagged with whose state it shows.
+#[derive(Component, Clone, Copy)]
+struct WaterCheckMark(WaterToggle);
+
+/// `visibleIf` for the water cells: the dials and sub-checkboxes show
+/// while Water is on; each sub-slider additionally needs its checkbox.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum WaterRow {
+    Water,
+    Ripple,
+    Bubble,
+}
+
+/// One popup cell: a half-row wrapper carrying the control's `visibleIf`
+/// marker — the flow popup's pattern (hiding the wrapper removes the cell
+/// from the wrap flow, so rows close up).
+fn cell(grid: &mut ChildSpawner, marker: impl Bundle, spawn: impl FnOnce(&mut ChildSpawner)) {
+    grid.spawn((
+        marker,
+        Node {
+            width: Val::Percent(47.0),
+            flex_direction: FlexDirection::Column,
+            ..default()
+        },
+    ))
+    .with_children(spawn);
+}
+
+/// The fish's options-popup content: instructions, the game and school
+/// sliders, the wiggle checkbox and its sliders, and the water layer's
+/// toggles and dials — in a two-column wrap (single-column overflowed the
+/// window once the water controls landed).
 fn spawn_popup(mut commands: Commands, settings: Res<FishSettings>, vsync: Res<VsyncEnabled>) {
     spawn_options_popup(
         &mut commands,
@@ -61,25 +102,133 @@ fn spawn_popup(mut commands: Commands, settings: Res<FishSettings>, vsync: Res<V
             "Feed it the gold dots and it grows.",
         ],
         |body: &mut ChildSpawner| {
-            for param in FishParam::MAIN {
-                spawn_slider(body, (), param, &settings, 14.0);
-            }
-            for param in FishParam::SCHOOL {
-                spawn_slider(body, SchoolRow, param, &settings, 14.0);
-            }
-            spawn_checkbox(
-                body,
-                WaveCheckbox,
-                WaveCheckMark,
-                "Wiggle (sine path)",
-                settings.wave,
-                14.0,
-            );
-            for param in FishParam::WAVE {
-                spawn_slider(body, WaveRow, param, &settings, 14.0);
-            }
+            body.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::Wrap,
+                justify_content: JustifyContent::SpaceBetween,
+                row_gap: Val::Px(6.0),
+                width: Val::Percent(100.0),
+                ..default()
+            })
+            .with_children(|grid| {
+                for param in FishParam::MAIN {
+                    cell(grid, (), |c| spawn_slider(c, (), param, &settings, 14.0));
+                }
+                for param in FishParam::SCHOOL {
+                    cell(grid, SchoolRow, |c| spawn_slider(c, (), param, &settings, 14.0));
+                }
+                cell(grid, (), |c| {
+                    spawn_checkbox(
+                        c,
+                        WaveCheckbox,
+                        WaveCheckMark,
+                        "Wiggle (sine path)",
+                        settings.wave,
+                        14.0,
+                    );
+                });
+                for param in FishParam::WAVE {
+                    cell(grid, WaveRow, |c| spawn_slider(c, (), param, &settings, 14.0));
+                }
+                // The pond (water.rs): master checkbox, the dials it
+                // reveals, and the ripple/bubble sub-toggles.
+                cell(grid, (), |c| {
+                    spawn_checkbox(
+                        c,
+                        WaterToggle::Water,
+                        WaterCheckMark(WaterToggle::Water),
+                        "Water",
+                        settings.water,
+                        14.0,
+                    );
+                });
+                for param in FishParam::WATER {
+                    cell(grid, WaterRow::Water, |c| {
+                        spawn_slider(c, (), param, &settings, 14.0);
+                    });
+                }
+                cell(grid, WaterRow::Water, |c| {
+                    spawn_checkbox(
+                        c,
+                        WaterToggle::Ripples,
+                        WaterCheckMark(WaterToggle::Ripples),
+                        "Ripples",
+                        settings.ripples,
+                        14.0,
+                    );
+                });
+                for param in FishParam::RIPPLE {
+                    cell(grid, WaterRow::Ripple, |c| {
+                        spawn_slider(c, (), param, &settings, 14.0);
+                    });
+                }
+                cell(grid, WaterRow::Water, |c| {
+                    spawn_checkbox(
+                        c,
+                        WaterToggle::Bubbles,
+                        WaterCheckMark(WaterToggle::Bubbles),
+                        "Bubbles",
+                        settings.bubbles,
+                        14.0,
+                    );
+                });
+                for param in FishParam::BUBBLE {
+                    cell(grid, WaterRow::Bubble, |c| {
+                        spawn_slider(c, (), param, &settings, 14.0);
+                    });
+                }
+            });
         },
     );
+}
+
+/// Clicks on the water checkboxes flip their settings.
+fn toggle_water_checkboxes(
+    boxes: Query<(&Interaction, &WaterToggle), Changed<Interaction>>,
+    mut settings: ResMut<FishSettings>,
+) {
+    for (interaction, toggle) in &boxes {
+        if *interaction == Interaction::Pressed {
+            match toggle {
+                WaterToggle::Water => settings.water = !settings.water,
+                WaterToggle::Ripples => settings.ripples = !settings.ripples,
+                WaterToggle::Bubbles => settings.bubbles = !settings.bubbles,
+            }
+        }
+    }
+}
+
+/// Keep the water check marks and cell visibility in sync with the
+/// settings — also right after the popup spawns (`Added`).
+fn sync_water_widgets(
+    settings: Res<FishSettings>,
+    added: Query<(), Or<(Added<WaterCheckMark>, Added<WaterRow>)>>,
+    mut marks: Query<(&mut Visibility, &WaterCheckMark)>,
+    mut rows: Query<(&mut Node, &WaterRow)>,
+) {
+    if !settings.is_changed() && added.is_empty() {
+        return;
+    }
+    for (mut visibility, mark) in &mut marks {
+        let on = match mark.0 {
+            WaterToggle::Water => settings.water,
+            WaterToggle::Ripples => settings.ripples,
+            WaterToggle::Bubbles => settings.bubbles,
+        };
+        *visibility = if on {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+    for (mut node, row) in &mut rows {
+        let on = match row {
+            WaterRow::Water => settings.water,
+            WaterRow::Ripple => settings.water && settings.ripples,
+            WaterRow::Bubble => settings.water && settings.bubbles,
+        };
+        node.display = if on { Display::Flex } else { Display::None };
+    }
 }
 
 fn toggle_wave_checkbox(

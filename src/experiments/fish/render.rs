@@ -634,10 +634,11 @@ impl Emitter {
         self.ear = ear;
     }
 
-    /// Stroke a polyline like LÖVE's default "smooth" line style at width
-    /// 1: a solid 1px core (±0.5px at full alpha) with a 1px feather
-    /// fading to transparent on each side — the original's overdraw
-    /// geometry.
+    /// Stroke a polyline like LÖVE's "smooth" line style — a solid core
+    /// at full alpha with a feather fading to transparent on each side —
+    /// but slimmer than the original's width-1 profile (±0.5px core,
+    /// ±1.5px feather): a deliberate deviation, the user found the ported
+    /// outlines too thick over the water.
     fn stroke_polyline(&mut self, points: &[Vec2], color: [u8; 4], closed: bool) {
         let n = points.len();
         if n < 2 {
@@ -671,10 +672,10 @@ impl Emitter {
             let normal = tangent.perp();
             let p = points[i];
             rows.push([
-                self.vertex(p + 1.5 * normal, transparent),
-                self.vertex(p + 0.5 * normal, color),
-                self.vertex(p - 0.5 * normal, color),
-                self.vertex(p - 1.5 * normal, transparent),
+                self.vertex(p + 1.1 * normal, transparent),
+                self.vertex(p + 0.35 * normal, color),
+                self.vertex(p - 0.35 * normal, color),
+                self.vertex(p - 1.1 * normal, transparent),
             ]);
         }
         let segments = if closed { n } else { n - 1 };
