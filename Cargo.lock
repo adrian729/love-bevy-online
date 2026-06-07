@@ -1779,6 +1779,7 @@ dependencies = [
  "bytemuck",
  "getrandom 0.3.4",
  "log",
+ "naga",
  "rand",
 ]
 

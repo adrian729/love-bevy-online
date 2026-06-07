@@ -11,6 +11,37 @@ use bevy::prelude::*;
 
 use crate::ui::SliderBinding;
 
+/// The pond's visual style (water.rs): the natural look, a hand-drawn
+/// sketch look (white wobbly ring linework over flat color, the way a
+/// cartoonist doodles water), and a glossy storybook look (soft gradients
+/// and clean rings). One sim, one toggle machine, three shader sets.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum WaterStyle {
+    #[default]
+    Natural = 0,
+    Sketch = 1,
+    Glossy = 2,
+}
+
+impl WaterStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Natural => "Natural",
+            Self::Sketch => "Sketch",
+            Self::Glossy => "Glossy",
+        }
+    }
+
+    /// The popup's style button cycles through the looks in order.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Natural => Self::Sketch,
+            Self::Sketch => Self::Glossy,
+            Self::Glossy => Self::Natural,
+        }
+    }
+}
+
 #[derive(Resource, Clone)]
 pub struct FishSettings {
     pub count: f32,       // how many fish; > 1 swims as a school of boids
@@ -27,7 +58,9 @@ pub struct FishSettings {
     // Top-down framing: caustics live on the pond bed, ripples and
     // sparkle on the surface, bubbles rise toward the camera.
     pub water: bool,           // the whole water layer (bed + surface + bubbles)
-    pub caustics: f32,         // bed light-web intensity (0 = plain bed)
+    pub style: WaterStyle,     // natural / sketch / glossy shader set
+    pub caustics: f32,         // light-pattern intensity (per style: bed webs,
+                               // ambient squiggle density, bed contours)
     pub sparkle: f32,          // ambient surface sun-sparkle intensity
     pub ripples: bool,         // fish wakes / food plops disturb the surface
     pub ripple_strength: f32,  // how hard the fish churn the water
@@ -53,6 +86,7 @@ impl Default for FishSettings {
             wave_freq: 4.5,
             wave_amp: 15.0,
             water: true,
+            style: WaterStyle::Natural,
             caustics: 0.55,
             sparkle: 0.35,
             ripples: true,
@@ -250,6 +284,14 @@ pub fn plugin(app: &mut App) {
     // water layer existed (the water defaults on).
     if std::env::args().skip(1).any(|arg| arg == "nowater") {
         settings.water = false;
+    }
+    // Style A/B switches: start on a non-default pond style (the popup's
+    // Style button) — visual/perf probes only.
+    if std::env::args().skip(1).any(|arg| arg == "sketch") {
+        settings.style = WaterStyle::Sketch;
+    }
+    if std::env::args().skip(1).any(|arg| arg == "glossy") {
+        settings.style = WaterStyle::Glossy;
     }
     // Water probe overrides (the flow CLI's `key=value` convention):
     // `ripple=3 caustics=0.2 sparkle=1` — tuning/perf probes only.

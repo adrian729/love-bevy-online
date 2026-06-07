@@ -5,13 +5,13 @@
 
 use bevy::prelude::*;
 
-use super::settings::{FishParam, FishSettings};
+use super::settings::{FishParam, FishSettings, WaterStyle};
 use super::sim::FishGame;
 use crate::app::{AppState, VsyncEnabled};
 use crate::experiments::{ExperimentId, experiment_active};
 use crate::ui::{
-    ChildSpawner, HudScore, NavAction, slider_plugin, spawn_checkbox, spawn_options_popup,
-    spawn_slider,
+    COLOR_NORMAL, ChildSpawner, HudScore, NavAction, slider_plugin, spawn_checkbox,
+    spawn_options_popup, spawn_slider,
 };
 
 pub fn plugin(app: &mut App) {
@@ -28,6 +28,8 @@ pub fn plugin(app: &mut App) {
             sync_school_rows,
             toggle_water_checkboxes,
             sync_water_widgets,
+            cycle_water_style,
+            sync_water_style_label,
             (update_score, reset_settings).run_if(experiment_active(ExperimentId::Fish)),
         ),
     );
@@ -51,14 +53,22 @@ struct WaveRow;
 #[derive(Component)]
 struct SchoolRow;
 
-/// The water layer's three checkboxes (water.rs) — the component doubles
-/// as the click target marker, like flow's FlowToggle.
+/// The water layer's checkboxes (water.rs) — the component doubles as the
+/// click target marker, like flow's FlowToggle.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum WaterToggle {
     Water,
     Ripples,
     Bubbles,
 }
+
+/// The clickable "Style" button cycling the pond through its looks
+/// (Natural / Sketch / Glossy), and the value label inside it.
+#[derive(Component)]
+struct WaterStyleButton;
+
+#[derive(Component)]
+struct WaterStyleLabel;
 
 /// A water checkbox's inner check mark, tagged with whose state it shows.
 #[derive(Component, Clone, Copy)]
@@ -130,8 +140,8 @@ fn spawn_popup(mut commands: Commands, settings: Res<FishSettings>, vsync: Res<V
                 for param in FishParam::WAVE {
                     cell(grid, WaveRow, |c| spawn_slider(c, (), param, &settings, 14.0));
                 }
-                // The pond (water.rs): master checkbox, the dials it
-                // reveals, and the ripple/bubble sub-toggles.
+                // The pond (water.rs): master checkbox, the style switch
+                // and dials it reveals, and the ripple/bubble sub-toggles.
                 cell(grid, (), |c| {
                     spawn_checkbox(
                         c,
@@ -141,6 +151,9 @@ fn spawn_popup(mut commands: Commands, settings: Res<FishSettings>, vsync: Res<V
                         settings.water,
                         14.0,
                     );
+                });
+                cell(grid, WaterRow::Water, |c| {
+                    spawn_style_row(c, settings.style);
                 });
                 for param in FishParam::WATER {
                     cell(grid, WaterRow::Water, |c| {
@@ -180,6 +193,76 @@ fn spawn_popup(mut commands: Commands, settings: Res<FishSettings>, vsync: Res<V
             });
         },
     );
+}
+
+/// The "Style" row: a label and a cycle button showing the current look —
+/// clicking advances Natural -> Sketch -> Glossy -> Natural. A button
+/// rather than a checkbox: three states, one obvious control.
+fn spawn_style_row(parent: &mut ChildSpawner, style: WaterStyle) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new("Style"),
+                TextFont::from_font_size(14.0),
+                TextColor(Color::WHITE),
+            ));
+            row.spawn((
+                WaterStyleButton,
+                Button,
+                Node {
+                    width: Val::Px(86.0),
+                    height: Val::Px(22.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(COLOR_NORMAL),
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    WaterStyleLabel,
+                    Text::new(style.label()),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::WHITE),
+                ));
+            });
+        });
+}
+
+/// Clicks on the style button advance the pond to its next look.
+fn cycle_water_style(
+    buttons: Query<&Interaction, (Changed<Interaction>, With<WaterStyleButton>)>,
+    mut settings: ResMut<FishSettings>,
+) {
+    for interaction in &buttons {
+        if *interaction == Interaction::Pressed {
+            settings.style = settings.style.next();
+        }
+    }
+}
+
+/// Keep the style button's label naming the current look — also right
+/// after the popup spawns, and after Reset settings.
+fn sync_water_style_label(
+    settings: Res<FishSettings>,
+    added: Query<(), Added<WaterStyleLabel>>,
+    mut labels: Query<&mut Text, With<WaterStyleLabel>>,
+) {
+    if !settings.is_changed() && added.is_empty() {
+        return;
+    }
+    for mut text in &mut labels {
+        if text.0 != settings.style.label() {
+            text.0 = settings.style.label().to_string();
+        }
+    }
 }
 
 /// Clicks on the water checkboxes flip their settings.
