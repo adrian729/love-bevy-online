@@ -306,11 +306,11 @@ impl Scratch {
     }
 }
 
-/// A pinch of flake food instead of the original's plain amber dot: a few
-/// small flat ellipses in warm tones scattered inside the old dot's
-/// footprint, the last few outlined white like everything else in the
-/// scene. The arrangement hashes off the drop position — stable while the
-/// food sits, fresh on every respawn.
+/// A pinch of flake food instead of the original's plain amber dot: a
+/// loose scatter of small flat ellipses in warm tones. The arrangement
+/// hashes off the drop position — stable while the food sits, fresh on
+/// every respawn. No linework: white rings swamped the warm fills at this
+/// size and the scatter read as a smudge.
 fn emit_food(emitter: &mut Emitter, center: Vec2, r: f32) {
     // PCG hash seeded from the drop position's bits.
     let mut state =
@@ -320,29 +320,22 @@ fn emit_food(emitter: &mut Emitter, center: Vec2, r: f32) {
         let word = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277_803_737);
         ((word >> 22) ^ word) as f32 * (1.0 / u32::MAX as f32)
     };
-    // A tiny drop (the food starts at the smallest fish's footprint and
-    // grows with the school) can't fit a whole pinch — shed flakes as it
-    // shrinks, down to the original's single outlined dot.
-    let flakes = ((r * 0.6) as usize).clamp(1, 6);
+    // The scatter radius and flake size are floored in pixels so even the
+    // game-start drop (r = 1 while every fish is small) shows a visible
+    // sprinkle, not a lone sub-pixel speck.
+    let spread = r.max(4.0);
+    let flakes = ((r * 1.2) as usize).clamp(4, 10);
     let spin = rand() * TAU;
-    let mut pinch = [(Vec2::ZERO, 0.0, 0.0, 0.0); 6];
-    for (i, flake) in pinch.iter_mut().enumerate().take(flakes) {
-        // Stratified angles so the pinch spreads instead of clumping.
+    for i in 0..flakes {
+        // Stratified angles so the sprinkle spreads instead of clumping.
         let angle = spin + (i as f32 + 0.7 * rand()) * (TAU / flakes as f32);
-        let dist = r * (0.15 + 0.47 * rand());
+        let dist = spread * (0.35 + 0.85 * rand());
         let pos = center + dist * Vec2::from_angle(angle);
-        let rx = r * (0.26 + 0.14 * rand());
+        let rx = (r * (0.24 + 0.12 * rand())).max(1.2);
         let ry = rx * (0.55 + 0.30 * rand());
         let rot = rand() * TAU;
         let tone = palette().flakes[(rand() * 3.0) as usize % 3];
-        *flake = (pos, rx, ry, rot);
         emitter.fill_ellipse(pos, rx, ry, rot, tone);
-    }
-    // Linework over the colour, like the rest of the scene — but only on
-    // every other flake: a white ring on all of them in a 20-px pinch
-    // would read as scribble.
-    for &(pos, rx, ry, rot) in pinch.iter().take(flakes).step_by(2) {
-        emitter.stroke_ellipse(pos, rx, ry, rot, palette().white);
     }
 }
 
