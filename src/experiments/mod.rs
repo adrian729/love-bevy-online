@@ -10,6 +10,7 @@
 pub mod fish;
 pub mod flock;
 pub mod flow;
+pub mod lizard;
 
 use bevy::prelude::*;
 
@@ -19,6 +20,7 @@ pub enum ExperimentId {
     Flock,
     Fish,
     Flow,
+    Lizard,
 }
 
 /// A registry entry: what the menu shows.
@@ -39,6 +41,10 @@ pub const EXPERIMENTS: &[Experiment] = &[
     Experiment {
         id: ExperimentId::Flow,
         title: "Flow Field",
+    },
+    Experiment {
+        id: ExperimentId::Lizard,
+        title: "Lizard",
     },
 ];
 

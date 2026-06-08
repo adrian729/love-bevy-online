@@ -21,7 +21,7 @@ mod menu;
 mod ui;
 
 use app::AppState;
-use experiments::{CurrentExperiment, ExperimentId, fish, flock, flow};
+use experiments::{CurrentExperiment, ExperimentId, fish, flock, flow, lizard};
 
 fn main() {
     // Perf-test mode (`boids <count> [fish|flow] [pin] [headless] [nosim]`):
@@ -29,6 +29,8 @@ fn main() {
     // real headroom past the display's refresh rate. The count is boids by
     // default, fish with the `fish` flag, particles with `flow`.
     //   fish     — perf-test the fish experiment instead of the flock.
+    //   lizard   — perf-test the lizard experiment (always one creature;
+    //              the count is ignored — the pipeline's minimum floor).
     //   flow     — perf-test the flow-field experiment; extra flags
     //              `streamlines`/`arrows`/`gradient` pick a non-default
     //              view, `evolve` animates the field, `worst` sets the
@@ -53,6 +55,8 @@ fn main() {
         ExperimentId::Fish
     } else if flag("flow") {
         ExperimentId::Flow
+    } else if flag("lizard") {
+        ExperimentId::Lizard
     } else {
         ExperimentId::Flock
     };
@@ -105,6 +109,7 @@ fn main() {
             flock::FlockPlugin { quads, headless },
             fish::FishPlugin { headless },
             flow::FlowPlugin { headless },
+            lizard::LizardPlugin { headless },
         ));
 
     // Perf runs (any CLI arg) skip the menu and boot straight into the
