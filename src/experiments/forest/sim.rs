@@ -30,7 +30,7 @@ use bevy::prelude::*;
 use bevy::tasks::ComputeTaskPool;
 use bytemuck::{Pod, Zeroable};
 
-use super::settings::ForestSettings;
+use super::settings::{ForestSettings, TreeParams};
 use crate::app::{AppState, RestartRequested, SimBounds, sim_active, update_sim_bounds};
 use crate::experiments::{CurrentExperiment, ExperimentId, experiment_active};
 use crate::ui::ValueEdit;
@@ -113,7 +113,7 @@ struct Probs {
 }
 
 impl Probs {
-    fn of(s: &ForestSettings) -> Self {
+    fn of(s: &TreeParams) -> Self {
         Self {
             no_expand: s.no_expand,
             forward: s.forward,
@@ -341,7 +341,7 @@ fn tip_hash(seed: u64, tip: u64) -> f32 {
 fn build_geometry(
     tokens: &[u8],
     seed: u64,
-    s: &ForestSettings,
+    s: &TreeParams,
     bounds: Vec2,
     geo: &mut TreeGeo,
 ) {
@@ -451,7 +451,7 @@ struct StructSig {
 }
 
 impl StructSig {
-    fn of(s: &ForestSettings) -> Self {
+    fn of(s: &TreeParams) -> Self {
         Self {
             growth: s.growth.floor().max(0.0) as u32,
             no_expand: s.no_expand,
@@ -479,7 +479,7 @@ struct GeoSig {
 }
 
 impl GeoSig {
-    fn of(s: &ForestSettings, bounds: Vec2) -> Self {
+    fn of(s: &TreeParams, bounds: Vec2) -> Self {
         Self {
             branch_angle: s.branch_angle,
             branch_length: s.branch_length,
@@ -515,104 +515,222 @@ impl Tree {
     }
 }
 
-/// The whole forest: its trees, the merged geometry the renderer uploads on a
-/// `version` bump, the wind clock, and the applied signatures that gate rebuilds.
+/// One forest: a stand of trees grown from a single [`TreeParams`] kind. The
+/// `seed` decorrelates this forest's trees from every other forest's (each tree
+/// is `seed ^ splitmix(i)`); the applied signatures gate its regrow/re-walk
+/// independently of the others, so editing one forest never rebuilds the rest.
+struct ForestInstance {
+    seed: u64,
+    trees: Vec<Tree>,
+    applied_struct: Option<StructSig>,
+    applied_geo: Option<GeoSig>,
+    applied_count: usize,
+}
+
+impl ForestInstance {
+    fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            trees: Vec::new(),
+            applied_struct: None,
+            applied_geo: None,
+            applied_count: 0,
+        }
+    }
+}
+
+/// A contiguous slice of the merged index buffer belonging to one forest — the
+/// renderer draws each range with that forest's own colour uniform.
+#[derive(Clone, Copy)]
+pub struct DrawRange {
+    pub start: u32,
+    pub count: u32,
+}
+
+/// The whole scene: one [`ForestInstance`] per [`TreeParams`] (kept index-aligned
+/// with `ForestSettings::forests`), the merged geometry the renderer uploads on a
+/// `version` bump, the per-forest index `ranges` (so each draws with its own
+/// colour), the shared wind clock, and the applied state that gates rebuilds.
 #[derive(Resource, Default)]
 pub struct Forest {
-    trees: Vec<Tree>,
-    seed: u64,
-    seeded: bool,
+    instances: Vec<ForestInstance>,
     pub vertices: Vec<ForestVertex>,
     pub indices: Vec<u32>,
+    pub ranges: Vec<DrawRange>,
     pub version: u64,
     pub total_segments: u64,
     /// Accumulated wind time (advances in Menu + Playing, freezes in Options).
     pub wind_time: f32,
-    applied_struct: Option<StructSig>,
-    applied_geo: Option<GeoSig>,
-    applied_count: usize,
+    applied_bounds: Option<[f32; 2]>,
     last_build: f32,
 }
 
+/// A fresh random seed for a newly created forest (a UI-rare action, so `rand`
+/// here is fine — the hot expand/build path stays rand-free).
+fn random_seed() -> u64 {
+    rand::Rng::random::<u64>(&mut rand::rng())
+}
+
 impl Forest {
-    /// Pick a fresh seed and drop the trees so the next update grows a
-    /// brand-new forest (the original's `reseed` + `regrow`).
-    fn reseed(&mut self) {
-        self.seed = rand::Rng::random::<u64>(&mut rand::rng());
-        self.seeded = true;
-        self.trees.clear();
-        self.applied_struct = None;
-        self.applied_geo = None;
-    }
-
-    /// Number of trees the forest currently holds (the score).
-    pub fn tree_count(&self) -> usize {
-        self.trees.len()
-    }
-
-    /// Grow/build the forest to the current settings: resize the tree list,
-    /// regrow only the trees whose structure changed (parallel), re-walk every
-    /// tree's turtle into geometry (parallel), concatenate, and bump the version.
-    fn rebuild(&mut self, s: &ForestSettings, bounds: Vec2, n: usize, ssig: StructSig, gsig: GeoSig) {
-        while self.trees.len() < n {
-            let i = self.trees.len() as u64;
-            let seed = self.seed ^ splitmix(i + 1);
-            self.trees.push(Tree::new(seed));
+    /// Regrow every forest from a fresh seed (the original's `randomize`/[R]):
+    /// new trees, same per-forest params. Clearing the applied bounds forces the
+    /// next `update_forest` to rebuild even though the forest list is unchanged.
+    fn regrow_all(&mut self) {
+        for inst in &mut self.instances {
+            inst.seed = random_seed();
+            inst.trees.clear();
+            inst.applied_struct = None;
+            inst.applied_geo = None;
+            inst.applied_count = 0;
         }
-        self.trees.truncate(n);
+        self.applied_bounds = None;
+    }
 
-        let budget = (MAX_SEGMENTS / n.max(1) as u64).max(1024);
-        let probs = Probs::of(s);
-        let growth = ssig.growth.min(64);
+    /// Total trees across every forest (the score).
+    pub fn tree_count(&self) -> usize {
+        self.instances.iter().map(|inst| inst.trees.len()).sum()
+    }
 
-        // Regrow pass: re-expand the token stream of any tree whose structural
-        // signature is stale (a fresh tree's is `None`). Parallel — each tree's
-        // RNG stream is independent.
+    /// Number of forests in the scene (the score / the selector's "/ N").
+    pub fn forest_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Whether anything that affects geometry changed since the last rebuild: a
+    /// forest added/removed, the window resized, or any forest's structure,
+    /// shape, count or leaves edited. Colour and wind never appear here — they're
+    /// shader uniforms read live, no rebuild.
+    fn needs_rebuild(&self, settings: &ForestSettings, bounds: Vec2) -> bool {
+        if self.instances.len() != settings.forests.len() {
+            return true;
+        }
+        if self.applied_bounds != Some([bounds.x, bounds.y]) {
+            return true;
+        }
+        self.instances
+            .iter()
+            .zip(settings.forests.iter())
+            .any(|(inst, params)| {
+                inst.applied_struct != Some(StructSig::of(params))
+                    || inst.applied_geo != Some(GeoSig::of(params, bounds))
+                    || inst.applied_count != count_of(params)
+            })
+    }
+
+    /// Grow/build the whole scene to the current settings: align the forest list,
+    /// regrow only the trees whose structure changed (parallel, across all
+    /// forests at once), re-walk every tree into geometry (parallel),
+    /// concatenate forest-by-forest recording each forest's index range, and bump
+    /// the version. The segment budget is shared across ALL trees in ALL forests,
+    /// so the VRAM/CPU ceiling is the scene's, not per-forest.
+    fn rebuild(&mut self, settings: &ForestSettings, bounds: Vec2) {
+        // 1. Reconcile the instance list to the forest list (new forests get a
+        //    fresh seed; a removed forest drops its instance positionally).
+        while self.instances.len() < settings.forests.len() {
+            self.instances.push(ForestInstance::new(random_seed()));
+        }
+        self.instances.truncate(settings.forests.len());
+
+        // 2. Per-tree segment budget, shared across the whole scene.
+        let total_trees: usize = settings.forests.iter().map(count_of).sum();
+        let budget = (MAX_SEGMENTS / total_trees.max(1) as u64).max(1024);
+
+        // 3. Reconcile each forest's tree list to its count.
+        for (inst, params) in self.instances.iter_mut().zip(settings.forests.iter()) {
+            let count = count_of(params);
+            while inst.trees.len() < count {
+                let i = inst.trees.len() as u64;
+                let seed = inst.seed ^ splitmix(i + 1);
+                inst.trees.push(Tree::new(seed));
+            }
+            inst.trees.truncate(count);
+        }
+
+        // 4. Regrow stale token streams — every tree across every forest in one
+        //    parallel scope (each tree's RNG stream is independent).
         let pool = ComputeTaskPool::get_or_init(Default::default);
         pool.scope(|scope| {
-            for tree in self.trees.iter_mut() {
-                scope.spawn(async move {
-                    if tree.token_sig != Some(ssig) {
-                        let mut scratch = Vec::new();
-                        tree.segments = expand(
-                            &mut tree.tokens,
-                            &mut scratch,
-                            &mut Rng::new(tree.seed),
-                            &probs,
-                            growth,
-                            budget,
-                        );
-                        tree.token_sig = Some(ssig);
-                    }
-                });
+            for (inst, params) in self.instances.iter_mut().zip(settings.forests.iter()) {
+                let ssig = StructSig::of(params);
+                let probs = Probs::of(params);
+                let growth = ssig.growth.min(64);
+                for tree in inst.trees.iter_mut() {
+                    scope.spawn(async move {
+                        if tree.token_sig != Some(ssig) {
+                            let mut scratch = Vec::new();
+                            tree.segments = expand(
+                                &mut tree.tokens,
+                                &mut scratch,
+                                &mut Rng::new(tree.seed),
+                                &probs,
+                                growth,
+                                budget,
+                            );
+                            tree.token_sig = Some(ssig);
+                        }
+                    });
+                }
             }
         });
-        self.total_segments = self.trees.iter().map(|t| t.segments).sum();
 
-        // Build pass: walk every tree's turtle into its own geometry buffer.
-        let mut outs: Vec<TreeGeo> = (0..n).map(|_| TreeGeo::default()).collect();
+        // 5. Build geometry for every tree (parallel), into one buffer per tree
+        //    grouped by forest so the concat can record per-forest ranges.
+        let mut geos: Vec<Vec<TreeGeo>> = self
+            .instances
+            .iter()
+            .map(|inst| inst.trees.iter().map(|_| TreeGeo::default()).collect())
+            .collect();
         pool.scope(|scope| {
-            for (tree, out) in self.trees.iter().zip(outs.iter_mut()) {
-                scope.spawn(async move {
-                    build_geometry(&tree.tokens, tree.seed, s, bounds, out);
-                });
+            for ((inst, params), inst_geos) in self
+                .instances
+                .iter()
+                .zip(settings.forests.iter())
+                .zip(geos.iter_mut())
+            {
+                for (tree, out) in inst.trees.iter().zip(inst_geos.iter_mut()) {
+                    scope.spawn(async move {
+                        build_geometry(&tree.tokens, tree.seed, params, bounds, out);
+                    });
+                }
             }
         });
 
-        // Concatenate into the merged buffer (offset each tree's indices).
+        // 6. Concatenate forest by forest, recording each forest's index range
+        //    (offset each tree's indices into the merged vertex buffer).
         self.vertices.clear();
         self.indices.clear();
-        for out in &outs {
-            let base = self.vertices.len() as u32;
-            self.vertices.extend_from_slice(&out.verts);
-            self.indices.extend(out.idx.iter().map(|i| i + base));
+        self.ranges.clear();
+        for inst_geos in &geos {
+            let start = self.indices.len() as u32;
+            for out in inst_geos {
+                let base = self.vertices.len() as u32;
+                self.vertices.extend_from_slice(&out.verts);
+                self.indices.extend(out.idx.iter().map(|i| i + base));
+            }
+            let count = self.indices.len() as u32 - start;
+            self.ranges.push(DrawRange { start, count });
         }
 
+        // 7. Record the applied state per forest + bump the version.
+        self.total_segments = self
+            .instances
+            .iter()
+            .flat_map(|inst| inst.trees.iter())
+            .map(|t| t.segments)
+            .sum();
+        for (inst, params) in self.instances.iter_mut().zip(settings.forests.iter()) {
+            inst.applied_struct = Some(StructSig::of(params));
+            inst.applied_geo = Some(GeoSig::of(params, bounds));
+            inst.applied_count = count_of(params);
+        }
+        self.applied_bounds = Some([bounds.x, bounds.y]);
         self.version = self.version.wrapping_add(1);
-        self.applied_struct = Some(ssig);
-        self.applied_geo = Some(gsig);
-        self.applied_count = n;
     }
+}
+
+/// A forest's tree count as a usize (the slider is an f32; at least one tree).
+fn count_of(params: &TreeParams) -> usize {
+    params.count.round().max(1.0) as usize
 }
 
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -643,8 +761,9 @@ pub fn plugin(app: &mut App) {
         .add_systems(Update, clear_when_inactive);
 }
 
-/// [R] / the popup's Restart / the menu's entry: a brand-new forest (a fresh
-/// seed, then a full regrow on the next `update_forest`).
+/// [R] / the popup's Regrow / the menu's entry: regrow every forest from fresh
+/// seeds (new trees, same per-forest params), applied on the next
+/// `update_forest`. (Adding/removing/selecting forests is the panel's job.)
 fn handle_restart(
     keys: Res<ButtonInput<KeyCode>>,
     state: Res<State<AppState>>,
@@ -660,12 +779,12 @@ fn handle_restart(
         return;
     }
     request.0 = false;
-    forest.reseed();
+    forest.regrow_all();
 }
 
-/// Rebuild the forest when a structural / geometry tunable, the tree count, or
-/// the window size changed — throttled while a slider is held, exact on release.
-/// Colour and wind never reach here (they're shader uniforms).
+/// Rebuild the scene when a structural / geometry tunable, a tree count, the
+/// forest list, or the window size changed — throttled while a slider is held,
+/// exact on release. Colour and wind never reach here (they're shader uniforms).
 fn update_forest(
     settings: Res<ForestSettings>,
     bounds: Res<SimBounds>,
@@ -673,32 +792,21 @@ fn update_forest(
     mouse: Res<ButtonInput<MouseButton>>,
     mut forest: ResMut<Forest>,
 ) {
-    if !forest.seeded {
-        forest.reseed();
-    }
-    let n = settings.count.round().max(1.0) as usize;
-    let ssig = StructSig::of(&settings);
-    let gsig = GeoSig::of(&settings, bounds.0);
-
-    let unchanged = forest.applied_struct == Some(ssig)
-        && forest.applied_geo == Some(gsig)
-        && forest.applied_count == n
-        && !forest.trees.is_empty();
-    if unchanged {
+    if !forest.needs_rebuild(&settings, bounds.0) {
         return;
     }
 
     let now = time.elapsed_secs();
-    // Live preview while dragging, throttled so a heavy forest isn't rebuilt
-    // every frame (the first build is never throttled).
-    if !forest.trees.is_empty()
+    // Live preview while dragging, throttled so a heavy scene isn't rebuilt
+    // every frame (the first build, with no instances yet, is never throttled).
+    if !forest.instances.is_empty()
         && mouse.pressed(MouseButton::Left)
         && now - forest.last_build < REGROW_THROTTLE
     {
         return;
     }
 
-    forest.rebuild(&settings, bounds.0, n, ssig, gsig);
+    forest.rebuild(&settings, bounds.0);
     forest.last_build = now;
 }
 
@@ -716,11 +824,10 @@ fn clear_when_inactive(current: Res<CurrentExperiment>, mut forest: ResMut<Fores
     }
     forest.vertices.clear();
     forest.indices.clear();
-    forest.trees.clear();
+    forest.ranges.clear();
+    forest.instances.clear();
     forest.total_segments = 0;
-    forest.applied_struct = None;
-    forest.applied_geo = None;
-    forest.applied_count = 0;
+    forest.applied_bounds = None;
     forest.version = forest.version.wrapping_add(1);
 }
 
@@ -860,7 +967,7 @@ mod tests {
     /// A default tree builds non-empty, finite geometry rooted on the ground.
     #[test]
     fn geometry_is_finite_and_grounded() {
-        let s = ForestSettings::default();
+        let s = TreeParams::default();
         let bounds = Vec2::new(1280.0, 800.0);
         let mut t = Vec::new();
         let mut scratch = Vec::new();
@@ -877,10 +984,11 @@ mod tests {
     }
 
     /// Structural sliders move `StructSig`; colour sliders move neither
-    /// signature (they're uniforms — no rebuild).
+    /// signature (they're uniforms — no rebuild). Wind is now a scene-global
+    /// setting, not a `TreeParams` field, so it can't appear in either sig.
     #[test]
     fn signatures_track_the_right_fields() {
-        let base = ForestSettings::default();
+        let base = TreeParams::default();
         let bounds = Vec2::new(1280.0, 800.0);
         let (bs, bg) = (StructSig::of(&base), GeoSig::of(&base, bounds));
 
@@ -896,9 +1004,30 @@ mod tests {
         let mut recolored = base.clone();
         recolored.hue = 200.0;
         recolored.brightness = 40.0;
-        recolored.wind = 0.7;
         assert_eq!(StructSig::of(&recolored), bs);
         assert_eq!(GeoSig::of(&recolored, bounds), bg);
+    }
+
+    /// A randomised forest lands inside every slider range (nothing degenerate
+    /// or un-editable), and two seeds give two different kinds of tree.
+    #[test]
+    fn random_params_are_in_range_and_distinct() {
+        use super::super::settings::ForestParam;
+        use crate::ui::SliderBinding;
+        for seed in 0..32u64 {
+            let p = TreeParams::random(seed);
+            let s = ForestSettings { forests: vec![p], selected: 0, wind: 0.0 };
+            for param in ForestParam::ALWAYS.iter().chain(ForestParam::LEAF.iter()) {
+                if *param == ForestParam::Wind {
+                    continue; // global, not a per-forest field
+                }
+                let (min, max) = param.range();
+                let v = param.get(&s);
+                assert!(v >= min - 1e-3 && v <= max + 1e-3, "{param:?} = {v} out of [{min},{max}]");
+            }
+        }
+        // Distinct kinds: different seeds differ in at least their hue.
+        assert_ne!(TreeParams::random(1).hue, TreeParams::random(2).hue);
     }
 
     /// The ported `hsl2rgb` matches `lib/color.lua` on the trunk default

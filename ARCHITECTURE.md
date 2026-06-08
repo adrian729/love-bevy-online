@@ -295,13 +295,21 @@ faithful original.
   built `F`-segments are hard-capped (`MAX_SEGMENTS`), enforced *during*
   expansion (a per-tree budget = `MAX_SEGMENTS / count` stops the rewrite early),
   so a pathological slider setting can neither OOM the CPU token buffers nor blow
-  up the GPU vertex buffer — it is the cap on *built geometry*, not tokens.
-- `render.rs` — one baked vertex buffer over the standard 2D view bind group, a
-  single `Transparent2d` indexed draw, premultiplied-alpha (the feather edges
-  emit alpha 0), the flow static-layer shape. Two deliberate departures, both
-  driven by the workload being **fill/overdraw-bound** (a dense canopy of
-  blended feathered branches can't early-z): the **fragment shader stays
-  trivial** (it returns the interpolated colour — the 1px feather is CPU-
+  up the GPU vertex buffer — it is the cap on *built geometry*, not tokens. The
+  scene holds **many forests**: `ForestSettings` is a list of `TreeParams` (one
+  per forest *kind*, each a different random tree) plus a `selected` index and the
+  shared `wind`; the sim keeps one `ForestInstance` (its own seed + tree stand +
+  applied signatures) per forest, so editing or regrowing one forest never
+  rebuilds the others. The segment budget is shared across **all** trees in all
+  forests (`MAX_SEGMENTS / total_trees`), so the ceiling is the scene's, not
+  per-forest. Geometry is concatenated forest-by-forest, recording each forest's
+  index range for the renderer.
+- `render.rs` — one baked vertex buffer over the standard 2D view bind group,
+  **one `Transparent2d` indexed draw per forest** (a handful), premultiplied-alpha
+  (the feather edges emit alpha 0), the flow static-layer shape. Two deliberate
+  departures, both driven by the workload being **fill/overdraw-bound** (a dense
+  canopy of blended feathered branches can't early-z): the **fragment shader
+  stays trivial** (it returns the interpolated colour — the 1px feather is CPU-
   expanded, *not* fragment-computed, since more fragment work would only worsen
   the bottleneck), and **colour + wind live in a uniform, not the vertices**.
   The 12-byte vertex carries only `{pos, packed}` where `packed` is
@@ -310,7 +318,11 @@ faithful original.
   `hsl2rgb` (`base_hue + hue_spread·level`, brightness ×1.2^level, clamped after
   the HSL like LÖVE's draw-time clamp, then sRGB→linear), so the hue/spread/
   brightness/leaf-hue sliders are free live updates — no regrow, no re-upload.
-  The same uniform carries the wind: a **height-weighted horizontal shear** (0 at
+  Each forest's colour is its own — the uniform is a **dynamic-offset
+  `DynamicUniformBuffer`** with one `ForestParams` per forest, and each forest's
+  draw binds its slice by dynamic offset over its recorded index range, so
+  per-forest colour stays a free live update with no geometry rebuild.
+  The shared uniform also carries the wind: a **height-weighted horizontal shear** (0 at
   the ground, concentrated toward the tips) times one oscillation **per tree**
   (keyed off the packed per-tree phase, NOT the x position), animated entirely in
   the vertex shader so the geometry stays baked while the canopy moves. Because
@@ -321,10 +333,16 @@ faithful original.
   branches. Wind 0 = the original's static forest.
 - New, additive controls (all at a faithful zero-position by default): **Wind**
   (the headline upgrade — the Lua forest was static; every other experiment
-  moves), **Leaves** + leaf size/density/hue (soft leaf fans at the twig tips,
-  baked into the same buffer), and **Size variation** (per-tree scale jitter for
-  depth). Feathered branches replace the original's hard aliased rectangles (the
-  collection's fish/flow line art language).
+  moves; it is **scene-shared** — one breeze through every forest), **Leaves** +
+  leaf size/density/hue (soft leaf fans at the twig tips, baked into the same
+  buffer), and **Size variation** (per-tree scale jitter for depth). Feathered
+  branches replace the original's hard aliased rectangles (the collection's
+  fish/flow line art language). A **forest selector** sits atop the panel
+  (`[<] Forest i/N [>]  [+] [-]`): `+` adds a forest of randomised trees and
+  selects it, `-` removes the selected one (keeping ≥1), and `<`/`>` choose which
+  forest the sliders edit — selecting mutates the settings resource, so every
+  slider resyncs to the new forest's values via the shared widgets' `is_changed`
+  watchers. The headless/perf harness pre-populates forests with `forests=N`.
 
 Perf (M4 Pro, headless): the per-frame cost is **fill/overdraw**, not vertex
 throughput or the (one-time, parallel, budget-bounded) regrow. The compound

@@ -35,10 +35,10 @@ use bevy::render::render_resource::binding_types::uniform_buffer;
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BlendState,
     BufferUsages, ColorTargetState, ColorWrites, CompareFunction, DepthBiasState,
-    DepthStencilState, FragmentState, IndexFormat, MultisampleState, PipelineCache,
-    PrimitiveState, PrimitiveTopology, RawBufferVec, RenderPipelineDescriptor, ShaderStages,
-    ShaderType, SpecializedRenderPipeline, SpecializedRenderPipelines, StencilFaceState,
-    StencilState, TextureFormat, UniformBuffer, VertexAttribute, VertexFormat, VertexState,
+    DepthStencilState, DynamicUniformBuffer, FragmentState, IndexFormat, MultisampleState,
+    PipelineCache, PrimitiveState, PrimitiveTopology, RawBufferVec, RenderPipelineDescriptor,
+    ShaderStages, ShaderType, SpecializedRenderPipeline, SpecializedRenderPipelines,
+    StencilFaceState, StencilState, TextureFormat, VertexAttribute, VertexFormat, VertexState,
     VertexStepMode,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
@@ -77,8 +77,9 @@ pub fn plugin(app: &mut App) {
         );
 }
 
-/// The vertex shader's uniforms (mirrors the WGSL `ForestParams`): the wind
-/// clock + the colour controls, all moved off the vertices so they update live.
+/// The vertex shader's uniforms (mirrors the WGSL `ForestParams`): the shared
+/// wind clock + the per-forest colour controls, all moved off the vertices so
+/// they update live. One of these per forest, addressed by a dynamic offset.
 #[derive(Clone, Copy, Default, ShaderType)]
 struct ForestParams {
     time: f32,
@@ -89,12 +90,22 @@ struct ForestParams {
     leaf_hue: f32,
 }
 
+/// One forest's draw: a contiguous slice of the merged index buffer plus the
+/// dynamic offset of its colour uniform.
+#[derive(Clone, Copy)]
+struct ForestDraw {
+    start: u32,
+    count: u32,
+    offset: u32,
+}
+
 /// Shader handle handed from the main world into the render app.
 #[derive(Resource)]
 struct ForestShader(Handle<Shader>);
 
 /// The render world's GPU state: the baked geometry (uploaded only on a version
-/// bump) and the per-frame colour/wind uniform.
+/// bump) and the per-frame per-forest colour/wind uniforms (one dynamic-offset
+/// uniform buffer holding one `ForestParams` per forest, plus the draw list).
 #[derive(Resource)]
 struct ForestBuffers {
     vertices: RawBufferVec<ForestVertex>,
@@ -102,8 +113,9 @@ struct ForestBuffers {
     index_count: u32,
     seen: Option<u64>,
     dirty: bool,
-    params: UniformBuffer<ForestParams>,
+    params: DynamicUniformBuffer<ForestParams>,
     params_bind_group: Option<BindGroup>,
+    draws: Vec<ForestDraw>,
 }
 
 impl Default for ForestBuffers {
@@ -114,8 +126,9 @@ impl Default for ForestBuffers {
             index_count: 0,
             seen: None,
             dirty: false,
-            params: UniformBuffer::default(),
+            params: DynamicUniformBuffer::default(),
             params_bind_group: None,
+            draws: Vec::new(),
         }
     }
 }
@@ -129,14 +142,41 @@ fn extract_forest(
     buffers: Option<ResMut<ForestBuffers>>,
 ) {
     let Some(mut buffers) = buffers else { return };
-    buffers.params.set(ForestParams {
-        time: forest.wind_time,
-        wind: settings.wind,
-        base_hue: settings.hue,
-        hue_spread: settings.hue_spread,
-        brightness: settings.brightness,
-        leaf_hue: settings.leaf_hue,
-    });
+
+    // Rebuild the per-forest colour/wind uniforms + draw list every frame (a
+    // handful of forests — cheap). Colour comes from the live settings (free
+    // update, no rebuild); the index ranges come from the baked geometry. Wind +
+    // the clock are scene-global, shared by every forest.
+    let time = forest.wind_time;
+    let wind = settings.wind;
+    buffers.params.clear();
+    buffers.draws.clear();
+    let mut pending = Vec::with_capacity(forest.ranges.len());
+    for (i, range) in forest.ranges.iter().enumerate() {
+        if range.count == 0 {
+            continue;
+        }
+        // Geometry and settings are index-aligned; if a transient mismatch ever
+        // leaves a range with no matching forest, skip it (nothing to colour).
+        let Some(p) = settings.forests.get(i) else {
+            continue;
+        };
+        let offset = buffers.params.push(&ForestParams {
+            time,
+            wind,
+            base_hue: p.hue,
+            hue_spread: p.hue_spread,
+            brightness: p.brightness,
+            leaf_hue: p.leaf_hue,
+        });
+        pending.push(ForestDraw {
+            start: range.start,
+            count: range.count,
+            offset,
+        });
+    }
+    buffers.draws = pending;
+
     if buffers.seen != Some(forest.version) {
         buffers.vertices.values_mut().clone_from(&forest.vertices);
         buffers.indices.values_mut().clone_from(&forest.indices);
@@ -168,13 +208,17 @@ fn prepare_forest(
     buffers.params.write_buffer(&render_device, &render_queue);
 
     let Some(pipeline) = pipeline else { return };
-    if buffers.params_bind_group.is_none() && buffers.params.buffer().is_some() {
-        buffers.params_bind_group = Some(render_device.create_bind_group(
+    // The dynamic uniform buffer can reallocate when a forest is added, so
+    // rebuild the bind group each frame from its current binding (one bind group,
+    // a handful of forests — negligible). `binding()` is `None` until the first
+    // entry exists.
+    buffers.params_bind_group = buffers.params.binding().map(|resource| {
+        render_device.create_bind_group(
             "forest_params",
             &pipeline_cache.get_bind_group_layout(&pipeline.params_layout),
-            &BindGroupEntries::single(&buffers.params),
-        ));
-    }
+            &BindGroupEntries::single(resource),
+        )
+    });
 }
 
 /// The forest pipeline: one baked vertex buffer over the standard 2D view
@@ -193,7 +237,7 @@ fn init_forest_pipeline(
 ) {
     let params_layout = BindGroupLayoutDescriptor::new(
         "forest_params_layout",
-        &BindGroupLayoutEntries::single(ShaderStages::VERTEX, uniform_buffer::<ForestParams>(false)),
+        &BindGroupLayoutEntries::single(ShaderStages::VERTEX, uniform_buffer::<ForestParams>(true)),
     );
     commands.insert_resource(ForestPipeline {
         mesh2d_pipeline: mesh2d_pipeline.clone(),
@@ -295,7 +339,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawForestGeometry {
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         let buffers = buffers.into_inner();
-        if buffers.index_count == 0 {
+        if buffers.index_count == 0 || buffers.draws.is_empty() {
             return RenderCommandResult::Success;
         }
         let Some(bind_group) = &buffers.params_bind_group else {
@@ -306,10 +350,14 @@ impl<P: PhaseItem> RenderCommand<P> for DrawForestGeometry {
         else {
             return RenderCommandResult::Failure("forest buffers not uploaded");
         };
-        pass.set_bind_group(1, bind_group, &[]);
         pass.set_vertex_buffer(0, vertices.slice(..));
         pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
-        pass.draw_indexed(0..buffers.index_count, 0, 0..1);
+        // One draw per forest, each binding its own colour uniform via a dynamic
+        // offset into the shared buffer (the shared wind/clock ride along in it).
+        for draw in &buffers.draws {
+            pass.set_bind_group(1, bind_group, &[draw.offset]);
+            pass.draw_indexed(draw.start..draw.start + draw.count, 0, 0..1);
+        }
         RenderCommandResult::Success
     }
 }

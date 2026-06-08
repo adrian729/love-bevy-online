@@ -25,12 +25,12 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use rand::Rng;
 
-use super::settings::FishSettings;
+use super::settings::{FishSettings, RandomizeOnEnter, WaterStyle};
 use crate::app::{
     AppState, PinnedAttractor, PointerOverUi, RestartRequested, SimBounds, sim_active,
     update_sim_bounds,
 };
-use crate::experiments::{ExperimentId, experiment_active};
+use crate::experiments::{CurrentExperiment, ExperimentId, experiment_active};
 
 /// Joints in the spine (`joint_count = 12`).
 pub const JOINTS: usize = 12;
@@ -824,7 +824,7 @@ pub fn plugin(app: &mut App) {
         .init_resource::<School>()
         .add_systems(
             Update,
-            (handle_restart, drive_fish)
+            (randomize_on_enter, handle_restart, drive_fish)
                 .chain()
                 .in_set(FishSimSet)
                 .after(update_sim_bounds)
@@ -832,6 +832,33 @@ pub fn plugin(app: &mut App) {
                 // Steps while playing AND behind the menu (the live backdrop).
                 .run_if(sim_active),
         );
+}
+
+/// Re-roll the fish count (1–7) and water style each time the experiment
+/// becomes current — runs before `handle_restart`, so the fresh count
+/// drives this entry's spawn (the fish list was cleared when we last left,
+/// so `handle_restart` takes its `fishes.0.is_empty()` re-spawn path). A
+/// CLI probe that pinned either value clears its flag in [`RandomizeOnEnter`]
+/// so the harness keeps exactly what it asked for.
+fn randomize_on_enter(
+    current: Res<CurrentExperiment>,
+    cfg: Res<RandomizeOnEnter>,
+    mut settings: ResMut<FishSettings>,
+) {
+    if !current.is_changed() || current.0 != ExperimentId::Fish {
+        return;
+    }
+    let mut rng = rand::rng();
+    if cfg.count {
+        settings.count = rng.random_range(1..=7) as f32;
+    }
+    if cfg.style {
+        settings.style = match rng.random_range(0..3) {
+            0 => WaterStyle::Natural,
+            1 => WaterStyle::Sketch,
+            _ => WaterStyle::Glossy,
+        };
+    }
 }
 
 /// Rebuild the fish on [R], on a UI restart request, or on first

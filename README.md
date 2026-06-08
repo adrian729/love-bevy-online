@@ -7,9 +7,11 @@ grows by eating, swimming as a whole school of boids once the Fish slider
 goes past 1), **flow field** (a Perlin-noise vector field shown as
 streamlines, arrows, a colour gradient, or particles riding it with
 glowing trails), **lizard** (a procedural FABRIK-spine lizard that walks
-toward the cursor and grows), and **forest** (procedural L-system trees
-grown by randomised branching, baked once and swayed by a vertex-shader
-wind). Same simulation rules, same tunables, same UI behaviour — rebuilt
+toward the cursor and grows), and **forest** (one or more stands of
+procedural L-system trees grown by randomised branching, baked once and
+swayed by a shared vertex-shader wind; add/select/remove forests of
+different trees from the panel). Same simulation rules, same tunables,
+similar UI behaviour — rebuilt
 on Bevy to see how far the same experiments can be pushed in Rust.
 
 Answer so far: **the LÖVE original capped at 300 boids; this port holds
@@ -159,12 +161,14 @@ across versions. Flags compose:
   `detail=`/`length=`/`seed=`/`fieldscale=`/`noise=`/`octaves=`/`warp=`/
   `swirl=` override single tunables for probe grids. Certified: 140,000
   particles at ~120 fps on the M4 Pro.
-- `forest` — perf-test the forest: `<count>` L-system trees.
+- `forest` — perf-test the forest: `<count>` L-system trees per forest.
   `growth=`/`length=`/`angle=`/`forward=`/`wind=`/`leafdensity=` override
-  single tunables; `dense` sets the structural worst case (growth 15, every
-  node branching three ways and extending into tiny segments — maximum
-  overdraw), `leaves`/`wind` enable those layers; `pin` is a no-op (no
-  pointer interaction). Certified: the compound worst case (`dense leaves
+  single tunables; `forests=N` populates N forests of different random trees
+  (the scene shares one wind, so `wind=` is global); `dense` sets the
+  structural worst case (growth 15, every node branching three ways and
+  extending into tiny segments — maximum overdraw), `leaves`/`wind` enable
+  those layers; `pin` is a no-op (no pointer interaction). Certified: the
+  compound worst case (`dense leaves
   wind`) holds ~110 fps at the 700-tree slider max and plateaus ~100 fps
   beyond it (a fixed segment budget bounds total geometry); ordinary
   forests run 1,000+ fps. See ARCHITECTURE.md.

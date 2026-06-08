@@ -45,6 +45,7 @@ use bevy::sprite_render::{
 use bevy::tasks::ComputeTaskPool;
 use bytemuck::{Pod, Zeroable};
 
+use super::settings::{FishSettings, FishView};
 use super::sim::{Fish, FishGame, Fishes, FishSimSet, JOINTS, orthogonal};
 use crate::app::{SimBounds, sim_active};
 use crate::experiments::{CurrentExperiment, ExperimentId, experiment_active};
@@ -74,6 +75,9 @@ struct Palette {
     white: [u8; 4],
     eye: [u8; 4],
     pupil: [u8; 4],
+    /// Skeleton-overlay green — a vivid neon so the bones read clearly over
+    /// the fish and the water (debug `FishView`, not from the original).
+    neon: [u8; 4],
 }
 
 fn linear_u8(r: f32, g: f32, b: f32) -> [u8; 4] {
@@ -99,6 +103,7 @@ fn palette() -> &'static Palette {
         white: [255, 255, 255, 255],
         eye: linear_u8(0.7, 0.7, 0.7),
         pupil: linear_u8(0.05, 0.05, 0.05),
+        neon: linear_u8(0.224, 1.0, 0.078),
     })
 }
 
@@ -160,16 +165,19 @@ struct ChunkBuffers(Vec<(Emitter, Scratch)>);
 /// school) build their geometry in parallel on the compute pool — each
 /// fish's part list is independent; only the final concatenation is
 /// ordered.
+#[allow(clippy::too_many_arguments)]
 fn rebuild_geometry(
     fishes: Res<Fishes>,
     game: Res<FishGame>,
     bounds: Res<SimBounds>,
+    settings: Res<FishSettings>,
     mut data: ResMut<FishDrawData>,
     mut emitter: Local<Emitter>,
     mut scratch: Local<Scratch>,
     mut chunks: Local<ChunkBuffers>,
 ) {
     let origin = bounds.0 / 2.0;
+    let view = settings.view;
     emitter.clear(origin);
 
     // The food draws first (minigames/fish.lua draw order). Any fish can
@@ -183,7 +191,7 @@ fn rebuild_geometry(
     let count = fishes.0.len();
     if count < 16 {
         for fish in &fishes.0 {
-            emit_fish(&mut emitter, &mut scratch, fish);
+            emit_fish_view(&mut emitter, &mut scratch, fish, view);
         }
         // Swap, don't copy: the emitter inherits last frame's capacity back.
         std::mem::swap(&mut data.vertices, &mut emitter.vertices);
@@ -203,7 +211,7 @@ fn rebuild_geometry(
                     let (emitter, scratch) = buffer;
                     emitter.clear(origin);
                     for fish in chunk {
-                        emit_fish(emitter, scratch, fish);
+                        emit_fish_view(emitter, scratch, fish, view);
                     }
                 });
             }
@@ -345,6 +353,34 @@ fn emit_fish(emitter: &mut Emitter, scratch: &mut Scratch, fish: &Fish) {
     emit_body(emitter, scratch, fish);
     emit_dorsal_fin(emitter, scratch, fish);
     emit_eyes(emitter, fish);
+}
+
+/// Emit one fish per the chosen [`FishView`]: the normal geometry, its
+/// skeleton, or both. The skeleton is emitted last so its triangles land
+/// after the body in the index buffer — painter order draws it on top.
+fn emit_fish_view(emitter: &mut Emitter, scratch: &mut Scratch, fish: &Fish, view: FishView) {
+    if view != FishView::Skeleton {
+        emit_fish(emitter, scratch, fish);
+    }
+    if view != FishView::Fish {
+        emit_skeleton(emitter, fish);
+    }
+}
+
+/// The spine laid bare in neon green — a body-width ring at each joint, the
+/// bone polyline through them, and a dot at every joint. The lizard's
+/// Skeleton view (`lizard/render.rs`) adapted to the fish's emitter.
+fn emit_skeleton(emitter: &mut Emitter, fish: &Fish) {
+    let neon = palette().neon;
+    let j = &fish.spine.joints;
+    for (i, &joint) in j.iter().enumerate() {
+        let r = fish.body_width(i);
+        emitter.stroke_ellipse(joint, r, r, 0.0, neon);
+    }
+    emitter.stroke_polyline(j, neon, false);
+    for &joint in j {
+        emitter.fill_circle(joint, 2.5, neon);
+    }
 }
 
 /// Two ellipses at joint 3's flanks, rotated ±60° off the spine.

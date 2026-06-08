@@ -42,6 +42,38 @@ impl WaterStyle {
     }
 }
 
+/// What the renderer draws: the fish as-is, only its neon-green skeleton
+/// (the spine joints, their body-width rings, and the bone polyline — like
+/// the lizard's Skeleton view), or both with the skeleton painted on top.
+/// A debug overlay; the default is the plain fish, so normal play and the
+/// parity tests are untouched.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum FishView {
+    #[default]
+    Fish,
+    Skeleton,
+    Both,
+}
+
+impl FishView {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fish => "Fish",
+            Self::Skeleton => "Skeleton",
+            Self::Both => "Both",
+        }
+    }
+
+    /// The popup's View button cycles through the modes in order.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Fish => Self::Skeleton,
+            Self::Skeleton => Self::Both,
+            Self::Both => Self::Fish,
+        }
+    }
+}
+
 #[derive(Resource, Clone)]
 pub struct FishSettings {
     pub count: f32,       // how many fish; > 1 swims as a school of boids
@@ -66,6 +98,8 @@ pub struct FishSettings {
     pub ripple_strength: f32,  // how hard the fish churn the water
     pub bubbles: bool,         // ambient bubbles rising to the surface
     pub bubble_count: f32,     // how many bubbles cycle at once
+    // Debug overlay, not part of the original.
+    pub view: FishView, // draw the fish, its skeleton, or both
 }
 
 impl Default for FishSettings {
@@ -93,8 +127,19 @@ impl Default for FishSettings {
             ripple_strength: 0.5,
             bubbles: true,
             bubble_count: 128.0,
+            view: FishView::Fish,
         }
     }
+}
+
+/// Whether the fish count / water style are free to be re-rolled each time
+/// the experiment opens (`sim::randomize_on_enter`). A CLI probe that pins
+/// a value (`fish <count>`, `sketch`, `glossy`) clears the matching flag so
+/// the perf/visual harness keeps exactly the value it asked for.
+#[derive(Resource)]
+pub struct RandomizeOnEnter {
+    pub count: bool,
+    pub style: bool,
 }
 
 /// The fish's slider-bound tunables (the wave checkbox is a separate
@@ -309,6 +354,21 @@ pub fn plugin(app: &mut App) {
             }
         }
     }
+    // A CLI probe that pins the count or style must survive the
+    // open-the-experiment re-roll (`sim::randomize_on_enter`); flag those
+    // values as not-free-to-re-roll. (Same arg scans as the blocks above.)
+    let count_cli = std::env::args().skip(1).any(|arg| arg == "fish")
+        && std::env::args()
+            .nth(1)
+            .and_then(|arg| arg.parse::<f32>().ok())
+            .is_some();
+    let style_cli = std::env::args()
+        .skip(1)
+        .any(|arg| arg == "sketch" || arg == "glossy");
+    app.insert_resource(RandomizeOnEnter {
+        count: !count_cli,
+        style: !style_cli,
+    });
     app.insert_resource(settings);
 }
 

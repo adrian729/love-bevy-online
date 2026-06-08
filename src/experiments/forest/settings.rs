@@ -17,8 +17,13 @@ use bevy::prelude::*;
 
 use crate::ui::SliderBinding;
 
-#[derive(Resource, Clone)]
-pub struct ForestSettings {
+/// One forest's worth of tunables — a single *kind* of tree, grown many times.
+/// The scene holds a list of these (see [`ForestSettings`]); each new forest
+/// gets a [randomised](TreeParams::random) set so it's a visibly different tree.
+/// Wind is NOT here — one breeze blows through the whole scene (see
+/// [`ForestSettings::wind`]).
+#[derive(Clone)]
+pub struct TreeParams {
     // Structure (regrow the L-system token stream when changed).
     pub count: f32,         // number of trees
     pub growth: f32,        // L-system iterations (the string grows ~2x/level)
@@ -32,11 +37,10 @@ pub struct ForestSettings {
     pub branch_length: f32,   // segment length (px)
     pub trunk_width: f32,     // base branch width (px); tapers toward the tips
     pub size_variation: f32,  // per-tree scale jitter (port addition; 0 = uniform)
-    // Colour / wind (pure shader uniforms; free live updates).
+    // Colour (per-forest shader uniform; free live update — one small draw each).
     pub hue: f32,        // base hue at the trunk (degrees) — original red default
     pub hue_spread: f32, // hue rotation per branch level (degrees)
     pub brightness: f32, // base lightness at the trunk (%); brightens outward
-    pub wind: f32,       // sway speed/strength (port addition; 0 = static original)
     // Leaves (port addition; OFF preserves the faithful bare L-system).
     pub leaves: bool,
     pub leaf_size: f32,    // leaf radius (px)
@@ -44,7 +48,7 @@ pub struct ForestSettings {
     pub leaf_hue: f32,     // leaf hue (degrees)
 }
 
-impl Default for ForestSettings {
+impl Default for TreeParams {
     fn default() -> Self {
         Self {
             // The original `tree.lua` defaults.
@@ -63,12 +67,115 @@ impl Default for ForestSettings {
             brightness: 10.0,
             // Port additions, all at their faithful zero-position.
             size_variation: 0.0,
-            wind: 0.0,
             leaves: false,
             leaf_size: 6.0,
             leaf_density: 0.6,
             leaf_hue: 110.0,
         }
+    }
+}
+
+impl TreeParams {
+    /// A randomised-but-sane parameter set for a freshly added forest, so the
+    /// "+" button always yields a visibly different *kind* of tree the user then
+    /// tunes. Every field lands inside its slider [`range`](ForestParam::range)
+    /// so nothing is degenerate or un-editable; the structure stays plausible (a
+    /// real-ish tree, not a hairball). `seed` makes it deterministic for tests.
+    pub fn random(seed: u64) -> Self {
+        // A tiny local splitmix stream — no dependency on the sim's RNG, and
+        // self-contained so the UI layer needn't reach into `sim`.
+        let mut state = seed | 1;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 // [0,1)
+        };
+        let lerp = |min: f32, max: f32, t: f32| min + t * (max - min);
+        Self {
+            count: lerp(3.0, 40.0, next()).round(),
+            growth: lerp(9.0, 14.0, next()).round(),
+            no_expand: lerp(0.0, 0.35, next()),
+            forward: lerp(0.2, 0.7, next()),
+            branch_left: lerp(0.2, 1.0, next()),
+            branch_right: lerp(0.2, 1.0, next()),
+            // Bias toward the two-way branches; a centre weight only sometimes.
+            branch_center: if next() < 0.4 { lerp(0.2, 1.0, next()) } else { 0.0 },
+            branch_angle: lerp(0.06, 0.22, next()),
+            branch_length: lerp(3.0, 8.0, next()),
+            trunk_width: lerp(6.0, 28.0, next()),
+            size_variation: lerp(0.0, 0.4, next()),
+            hue: lerp(0.0, 360.0, next()),
+            hue_spread: lerp(0.0, 40.0, next()),
+            brightness: lerp(8.0, 22.0, next()),
+            // Leaves on ~half the time, with a matching-ish hue near the trunk.
+            leaves: next() < 0.5,
+            leaf_size: lerp(3.0, 10.0, next()),
+            leaf_density: lerp(0.3, 1.0, next()),
+            leaf_hue: lerp(0.0, 360.0, next()),
+        }
+    }
+}
+
+/// The whole scene's forest settings: a list of [`TreeParams`] (one per forest
+/// kind), which one the UI is editing, and the single shared wind. The
+/// `SliderBinding` routes every tunable except `Wind` to the *selected* forest,
+/// so the existing slider panel edits whichever forest is current; `Wind` is
+/// global. (One Resource keeps the shared slider machinery — which keys its
+/// resync off `is_changed` — working unchanged: selecting a forest mutates this
+/// resource and every slider snaps to the new forest's values.)
+#[derive(Resource, Clone)]
+pub struct ForestSettings {
+    pub forests: Vec<TreeParams>,
+    pub selected: usize,
+    pub wind: f32, // shared by all forests: one breeze through the whole scene
+}
+
+impl Default for ForestSettings {
+    fn default() -> Self {
+        Self {
+            forests: vec![TreeParams::default()],
+            selected: 0,
+            wind: 0.0,
+        }
+    }
+}
+
+impl ForestSettings {
+    /// The forest the sliders currently edit (selection is always kept in range
+    /// by the add/remove systems, but clamp defensively).
+    pub fn current(&self) -> &TreeParams {
+        &self.forests[self.selected.min(self.forests.len() - 1)]
+    }
+
+    pub fn current_mut(&mut self) -> &mut TreeParams {
+        let i = self.selected.min(self.forests.len() - 1);
+        &mut self.forests[i]
+    }
+
+    /// Add a new forest with [randomised](TreeParams::random) params and select
+    /// it. `seed` keeps the choice deterministic for tests.
+    pub fn add_forest(&mut self, seed: u64) {
+        self.forests.push(TreeParams::random(seed));
+        self.selected = self.forests.len() - 1;
+    }
+
+    /// Remove the selected forest, keeping at least one (the selector hides the
+    /// remove button at one forest, but guard anyway). Selection clamps down.
+    pub fn remove_selected(&mut self) {
+        if self.forests.len() <= 1 {
+            return;
+        }
+        let i = self.selected.min(self.forests.len() - 1);
+        self.forests.remove(i);
+        self.selected = self.selected.min(self.forests.len() - 1);
+    }
+
+    /// Step the selection by `delta` (the ◀ / ▶ buttons), wrapping around.
+    pub fn select_step(&mut self, delta: i32) {
+        let n = self.forests.len() as i32;
+        self.selected = (self.selected as i32 + delta).rem_euclid(n) as usize;
     }
 }
 
@@ -221,50 +328,61 @@ impl SliderBinding for ForestParam {
     }
 
     fn get(self, s: &ForestSettings) -> f32 {
+        // Wind is the one shared (global) tunable; everything else reads from
+        // the forest currently being edited.
+        if self == Self::Wind {
+            return s.wind;
+        }
+        let p = s.current();
         match self {
-            Self::Count => s.count,
-            Self::Growth => s.growth,
-            Self::NoExpand => s.no_expand,
-            Self::Forward => s.forward,
-            Self::BranchLeft => s.branch_left,
-            Self::BranchRight => s.branch_right,
-            Self::BranchCenter => s.branch_center,
-            Self::BranchAngle => s.branch_angle,
-            Self::BranchLength => s.branch_length,
-            Self::TrunkWidth => s.trunk_width,
-            Self::SizeVariation => s.size_variation,
-            Self::Hue => s.hue,
-            Self::HueSpread => s.hue_spread,
-            Self::Brightness => s.brightness,
-            Self::Wind => s.wind,
-            Self::LeafSize => s.leaf_size,
-            Self::LeafDensity => s.leaf_density,
-            Self::LeafHue => s.leaf_hue,
+            Self::Count => p.count,
+            Self::Growth => p.growth,
+            Self::NoExpand => p.no_expand,
+            Self::Forward => p.forward,
+            Self::BranchLeft => p.branch_left,
+            Self::BranchRight => p.branch_right,
+            Self::BranchCenter => p.branch_center,
+            Self::BranchAngle => p.branch_angle,
+            Self::BranchLength => p.branch_length,
+            Self::TrunkWidth => p.trunk_width,
+            Self::SizeVariation => p.size_variation,
+            Self::Hue => p.hue,
+            Self::HueSpread => p.hue_spread,
+            Self::Brightness => p.brightness,
+            Self::LeafSize => p.leaf_size,
+            Self::LeafDensity => p.leaf_density,
+            Self::LeafHue => p.leaf_hue,
+            Self::Wind => unreachable!("handled above"),
         }
     }
 
     fn set(self, s: &mut ForestSettings, value: f32) {
         let (min, max) = self.range();
         let value = value.clamp(min, max);
+        if self == Self::Wind {
+            s.wind = value;
+            return;
+        }
+        let p = s.current_mut();
         match self {
-            Self::Count => s.count = value,
-            Self::Growth => s.growth = value,
-            Self::NoExpand => s.no_expand = value,
-            Self::Forward => s.forward = value,
-            Self::BranchLeft => s.branch_left = value,
-            Self::BranchRight => s.branch_right = value,
-            Self::BranchCenter => s.branch_center = value,
-            Self::BranchAngle => s.branch_angle = value,
-            Self::BranchLength => s.branch_length = value,
-            Self::TrunkWidth => s.trunk_width = value,
-            Self::SizeVariation => s.size_variation = value,
-            Self::Hue => s.hue = value,
-            Self::HueSpread => s.hue_spread = value,
-            Self::Brightness => s.brightness = value,
-            Self::Wind => s.wind = value,
-            Self::LeafSize => s.leaf_size = value,
-            Self::LeafDensity => s.leaf_density = value,
-            Self::LeafHue => s.leaf_hue = value,
+            Self::Count => p.count = value,
+            Self::Growth => p.growth = value,
+            Self::NoExpand => p.no_expand = value,
+            Self::Forward => p.forward = value,
+            Self::BranchLeft => p.branch_left = value,
+            Self::BranchRight => p.branch_right = value,
+            Self::BranchCenter => p.branch_center = value,
+            Self::BranchAngle => p.branch_angle = value,
+            Self::BranchLength => p.branch_length = value,
+            Self::TrunkWidth => p.trunk_width = value,
+            Self::SizeVariation => p.size_variation = value,
+            Self::Hue => p.hue = value,
+            Self::HueSpread => p.hue_spread = value,
+            Self::Brightness => p.brightness = value,
+            Self::LeafSize => p.leaf_size = value,
+            Self::LeafDensity => p.leaf_density = value,
+            Self::LeafHue => p.leaf_hue = value,
+            Self::Wind => unreachable!("handled above"),
         }
     }
 
@@ -309,33 +427,32 @@ pub fn plugin(app: &mut App) {
     let mut settings = ForestSettings::default();
     // Perf-harness overrides (`cargo run --release -- <count> forest
     // [growth=N] [wind] [leaves] [dense] ...`). Guarded on the `forest` flag so
-    // other experiments' counts don't leak in here (the fish/flow pattern).
-    // Count is set RAW, not through `ForestParam::set` — the slider range must
-    // not clamp a perf run.
+    // other experiments' counts don't leak in here (the fish/flow pattern). They
+    // configure the single default forest (forests[0]); `wind` is the shared,
+    // scene-global setting. Count is set RAW, not through `ForestParam::set` —
+    // the slider range must not clamp a perf run.
     let flag = |name: &str| std::env::args().skip(1).any(|arg| arg == name);
     if flag("forest") {
+        let p = &mut settings.forests[0];
         if let Some(count) = std::env::args().nth(1).and_then(|arg| arg.parse().ok()) {
-            settings.count = count;
-        }
-        if flag("wind") {
-            settings.wind = 0.5;
+            p.count = count;
         }
         if flag("leaves") {
-            settings.leaves = true;
-            settings.leaf_density = 1.0;
+            p.leaves = true;
+            p.leaf_density = 1.0;
         }
         // The experiment's structural worst case: every node branches three
         // ways and extends, nothing rests, and segments are tiny (the most,
         // shortest, most-overlapping segments per pixel — the overdraw wall).
         if flag("dense") {
-            settings.growth = 15.0;
-            settings.no_expand = 0.0;
-            settings.forward = 1.0;
-            settings.branch_left = 1.0;
-            settings.branch_right = 1.0;
-            settings.branch_center = 1.0;
-            settings.branch_length = 1.0;
-            settings.branch_angle = 0.25;
+            p.growth = 15.0;
+            p.no_expand = 0.0;
+            p.forward = 1.0;
+            p.branch_left = 1.0;
+            p.branch_right = 1.0;
+            p.branch_center = 1.0;
+            p.branch_length = 1.0;
+            p.branch_angle = 0.25;
         }
         // Probe overrides (`key=value`), so a stress grid needs no rebuild
         // per point.
@@ -347,22 +464,38 @@ pub fn plugin(app: &mut App) {
             })
         };
         if let Some(v) = kv("growth") {
-            settings.growth = v;
+            p.growth = v;
         }
         if let Some(v) = kv("length") {
-            settings.branch_length = v;
+            p.branch_length = v;
         }
         if let Some(v) = kv("angle") {
-            settings.branch_angle = v;
+            p.branch_angle = v;
         }
         if let Some(v) = kv("forward") {
-            settings.forward = v;
+            p.forward = v;
+        }
+        if let Some(v) = kv("leafdensity") {
+            p.leaf_density = v;
+        }
+        // Wind is shared (scene-global), so it lives on the container.
+        if flag("wind") {
+            settings.wind = 0.5;
         }
         if let Some(v) = kv("wind") {
             settings.wind = v;
         }
-        if let Some(v) = kv("leafdensity") {
-            settings.leaf_density = v;
+        // `forests=N` pre-populates the scene with N forests of different random
+        // trees (forest[0] keeps the flags above), for the multi-forest perf
+        // harness and headless visual checks where there's no UI to press [+].
+        if let Some(n) = kv("forests") {
+            let n = (n.round() as usize).clamp(1, 12);
+            let mut i = 1u64;
+            while settings.forests.len() < n {
+                settings.add_forest(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                i += 1;
+            }
+            settings.selected = 0;
         }
     }
     app.insert_resource(settings);

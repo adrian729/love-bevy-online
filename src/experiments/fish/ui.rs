@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use super::settings::{FishParam, FishSettings, WaterStyle};
+use super::settings::{FishParam, FishSettings, FishView, WaterStyle};
 use super::sim::FishGame;
 use crate::app::{AppState, VsyncEnabled};
 use crate::experiments::{ExperimentId, experiment_active};
@@ -30,6 +30,8 @@ pub fn plugin(app: &mut App) {
             sync_water_widgets,
             cycle_water_style,
             sync_water_style_label,
+            cycle_skeleton_view,
+            sync_skeleton_view_label,
             (update_score, reset_settings).run_if(experiment_active(ExperimentId::Fish)),
         ),
     );
@@ -69,6 +71,14 @@ struct WaterStyleButton;
 
 #[derive(Component)]
 struct WaterStyleLabel;
+
+/// The clickable "View" button cycling the renderer between the fish, its
+/// skeleton, and both (Fish / Skeleton / Both), and the value label inside.
+#[derive(Component)]
+struct SkeletonViewButton;
+
+#[derive(Component)]
+struct SkeletonViewLabel;
 
 /// A water checkbox's inner check mark, tagged with whose state it shows.
 #[derive(Component, Clone, Copy)]
@@ -124,6 +134,8 @@ fn spawn_popup(mut commands: Commands, settings: Res<FishSettings>, vsync: Res<V
                 for param in FishParam::MAIN {
                     cell(grid, (), |c| spawn_slider(c, (), param, &settings, 14.0));
                 }
+                // Debug overlay: draw the fish, its neon-green skeleton, or both.
+                cell(grid, (), |c| spawn_view_row(c, settings.view));
                 for param in FishParam::SCHOOL {
                     cell(grid, SchoolRow, |c| spawn_slider(c, (), param, &settings, 14.0));
                 }
@@ -261,6 +273,76 @@ fn sync_water_style_label(
     for mut text in &mut labels {
         if text.0 != settings.style.label() {
             text.0 = settings.style.label().to_string();
+        }
+    }
+}
+
+/// The "View" row: a label and a cycle button showing the current draw mode
+/// — clicking advances Fish -> Skeleton -> Both -> Fish. A button rather
+/// than a checkbox, for the same reason as Style: three states, one control.
+fn spawn_view_row(parent: &mut ChildSpawner, view: FishView) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new("View"),
+                TextFont::from_font_size(14.0),
+                TextColor(Color::WHITE),
+            ));
+            row.spawn((
+                SkeletonViewButton,
+                Button,
+                Node {
+                    width: Val::Px(86.0),
+                    height: Val::Px(22.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(COLOR_NORMAL),
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    SkeletonViewLabel,
+                    Text::new(view.label()),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::WHITE),
+                ));
+            });
+        });
+}
+
+/// Clicks on the View button advance the renderer to its next draw mode.
+fn cycle_skeleton_view(
+    buttons: Query<&Interaction, (Changed<Interaction>, With<SkeletonViewButton>)>,
+    mut settings: ResMut<FishSettings>,
+) {
+    for interaction in &buttons {
+        if *interaction == Interaction::Pressed {
+            settings.view = settings.view.next();
+        }
+    }
+}
+
+/// Keep the View button's label naming the current mode — also right after
+/// the popup spawns, and after Reset settings.
+fn sync_skeleton_view_label(
+    settings: Res<FishSettings>,
+    added: Query<(), Added<SkeletonViewLabel>>,
+    mut labels: Query<&mut Text, With<SkeletonViewLabel>>,
+) {
+    if !settings.is_changed() && added.is_empty() {
+        return;
+    }
+    for mut text in &mut labels {
+        if text.0 != settings.view.label() {
+            text.0 = settings.view.label().to_string();
         }
     }
 }
