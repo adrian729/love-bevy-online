@@ -1,20 +1,27 @@
 # love-bevy-online — the LÖVE experiments in Bevy/Rust
 
 A Bevy port of the LÖVE/Lua `love-online` project: a start menu with a
-live experiment animating behind it, and three experiments so far —
+live experiment animating behind it, and five experiments so far —
 **flock** (Reynolds boids), **fish** (a procedural FABRIK fish that
 grows by eating, swimming as a whole school of boids once the Fish slider
-goes past 1), and **flow field** (a Perlin-noise vector field shown as
+goes past 1), **flow field** (a Perlin-noise vector field shown as
 streamlines, arrows, a colour gradient, or particles riding it with
-glowing trails). Same simulation rules, same tunables, same UI behaviour —
-rebuilt on Bevy to see how far the same experiments can be pushed in Rust.
+glowing trails), **lizard** (a procedural FABRIK-spine lizard that walks
+toward the cursor and grows), and **forest** (procedural L-system trees
+grown by randomised branching, baked once and swayed by a vertex-shader
+wind). Same simulation rules, same tunables, same UI behaviour — rebuilt
+on Bevy to see how far the same experiments can be pushed in Rust.
 
 Answer so far: **the LÖVE original capped at 300 boids; this port holds
 ~100+ fps at 640,000**, with the slider allowing 1.28 million. The fish
 school holds ~100+ fps at 4,096 spline-rendered fish (the original's
 school suggested raising past ~30 "with care"), slider allowing 8,192.
 The flow field holds ~120 fps at 140,000 glowing-trail particles (the
-original capped its slider at 6,000), slider allowing 300,000.
+original capped its slider at 6,000), slider allowing 300,000. The forest
+(the original capped its slider at 30 trees) holds ~100+ fps even at its
+*compound worst case* — every node branching three ways into tiny dense
+segments, with leaves and wind on — across the whole slider range to 700
+trees; ordinary forests run at 1,000+ fps.
 
 ```sh
 cargo run            # dev profile: fast iteration (dynamic linking, opt-level 1)
@@ -131,7 +138,7 @@ That's where the optimize-without-changing-behaviour loop stops.
 ### Perf harness
 
 ```sh
-cargo run --release -- <count> [fish|flow] [pin] [headless] [cpu] [nosim] [geo]
+cargo run --release -- <count> [fish|flow|forest] [pin] [headless] [cpu] [nosim] [geo]
 ```
 
 Prints fps once a second (vsync off). Any CLI argument skips the menu and
@@ -152,6 +159,15 @@ across versions. Flags compose:
   `detail=`/`length=`/`seed=`/`fieldscale=`/`noise=`/`octaves=`/`warp=`/
   `swirl=` override single tunables for probe grids. Certified: 140,000
   particles at ~120 fps on the M4 Pro.
+- `forest` — perf-test the forest: `<count>` L-system trees.
+  `growth=`/`length=`/`angle=`/`forward=`/`wind=`/`leafdensity=` override
+  single tunables; `dense` sets the structural worst case (growth 15, every
+  node branching three ways and extending into tiny segments — maximum
+  overdraw), `leaves`/`wind` enable those layers; `pin` is a no-op (no
+  pointer interaction). Certified: the compound worst case (`dense leaves
+  wind`) holds ~110 fps at the 700-tree slider max and plateaus ~100 fps
+  beyond it (a fixed segment budget bounds total geometry); ordinary
+  forests run 1,000+ fps. See ARCHITECTURE.md.
 - `pin` — fake mouse attractor at screen centre (sustained worst case).
 - `headless` — no window: renders to an offscreen texture, schedule
   free-runs, and a snapshot lands in `/tmp/boids_headless_{0,1,2}.png`

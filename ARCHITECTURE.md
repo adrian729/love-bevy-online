@@ -264,6 +264,83 @@ tick, so every frame pays a full rebuild and fps cliffs to ~24. Length
 is border-bounded (lines leave the window long before the step cap), so
 doubling it to 300 was free.
 
+## The forest experiment (`src/experiments/forest/`)
+
+A port of the original's `minigames/tree.lua` + `lib/tree.lua`: a forest of
+procedural **L-system** trees grown by randomised string rewriting and walked
+by a turtle into line geometry, baked once and redrawn each frame (the
+original's render-once-to-a-canvas). Like flow, it declares
+`onscreenControls = 'all'` and re-uploads its baked geometry only on a version
+bump. Like flow's flow-field port, it is deliberately **better, not 1:1** — the
+13 original tunables and their defaults are kept exactly (a red, brightening-
+outward L-system tree at the defaults), and every addition zeroes back to the
+faithful original.
+
+- `sim.rs` — the model, in window coordinates (y-flip at vertex emission, the
+  flow/fish convention). The L-system rewrites **ping-pong `u8` token buffers**
+  (`expand_once` matches `lib/tree.lua`'s rewrite order and per-character RNG
+  draw count exactly, so the morph-in-place behaviour holds) rather than the
+  Lua's O(n²) string concat. A turtle then walks the tokens, **coalescing each
+  straight same-level run of `F`s into one feathered quad** (visually identical
+  to the Lua's per-segment rectangles, far fewer vertices when `forward` makes
+  long limbs). The two-signature scheme is the original's: a **structural**
+  change (growth + the 5 rewrite probabilities) regrows the token streams; a
+  **geometry** change (branch angle/length/width, size variation, leaf
+  size/density, the window size) only re-walks the turtle — both throttled to
+  ~15/s while a slider is held, exact on release. Each tree is seeded per index
+  (`forest_seed ^ splitmix(i)`), so a structural tweak morphs every tree in
+  place and adding/removing trees leaves the rest untouched; regrow + geometry
+  build both run **parallel across trees** on the compute pool, then concatenate
+  into one merged buffer. The load-bearing safety is a **segment budget**: total
+  built `F`-segments are hard-capped (`MAX_SEGMENTS`), enforced *during*
+  expansion (a per-tree budget = `MAX_SEGMENTS / count` stops the rewrite early),
+  so a pathological slider setting can neither OOM the CPU token buffers nor blow
+  up the GPU vertex buffer — it is the cap on *built geometry*, not tokens.
+- `render.rs` — one baked vertex buffer over the standard 2D view bind group, a
+  single `Transparent2d` indexed draw, premultiplied-alpha (the feather edges
+  emit alpha 0), the flow static-layer shape. Two deliberate departures, both
+  driven by the workload being **fill/overdraw-bound** (a dense canopy of
+  blended feathered branches can't early-z): the **fragment shader stays
+  trivial** (it returns the interpolated colour — the 1px feather is CPU-
+  expanded, *not* fragment-computed, since more fragment work would only worsen
+  the bottleneck), and **colour + wind live in a uniform, not the vertices**.
+  The 12-byte vertex carries only `{pos, packed}` where `packed` is
+  `{branch level, leaf flag, coreness/alpha, sway weight, per-tree wind phase}`;
+  the **vertex shader** computes the branch colour from `lib/color.lua`'s
+  `hsl2rgb` (`base_hue + hue_spread·level`, brightness ×1.2^level, clamped after
+  the HSL like LÖVE's draw-time clamp, then sRGB→linear), so the hue/spread/
+  brightness/leaf-hue sliders are free live updates — no regrow, no re-upload.
+  The same uniform carries the wind: a **height-weighted horizontal shear** (0 at
+  the ground, concentrated toward the tips) times one oscillation **per tree**
+  (keyed off the packed per-tree phase, NOT the x position), animated entirely in
+  the vertex shader so the geometry stays baked while the canopy moves. Because
+  the displacement is a continuous function of height alone, the whole tree leans
+  back and forth as one body — horizontal limbs keep their length and branch
+  junctions never crack — and the per-tree phase (not x) gives the variety; an
+  earlier per-x phase made a travelling wave that visibly stretched horizontal
+  branches. Wind 0 = the original's static forest.
+- New, additive controls (all at a faithful zero-position by default): **Wind**
+  (the headline upgrade — the Lua forest was static; every other experiment
+  moves), **Leaves** + leaf size/density/hue (soft leaf fans at the twig tips,
+  baked into the same buffer), and **Size variation** (per-tree scale jitter for
+  depth). Feathered branches replace the original's hard aliased rectangles (the
+  collection's fish/flow line art language).
+
+Perf (M4 Pro, headless): the per-frame cost is **fill/overdraw**, not vertex
+throughput or the (one-time, parallel, budget-bounded) regrow. The compound
+worst case — `dense` probs (growth 15, every node branching three ways and
+extending) with tiny segments for maximum overdraw, plus leaves and wind — holds
+**~110 fps at the 700-tree slider max**, and *plateaus at ~100 fps* at any higher
+count: the segment budget bounds total geometry and the canopy saturates the
+1280×800 screen, so fps cannot fall much further. Ordinary forests (default
+probabilities, even at growth 15 and hundreds of trees) run 1,000+ fps. The
+budget (`MAX_SEGMENTS`) is the governor, tuned so the *pathological* worst case
+sits in the ~100–120 band while normal use never approaches it. The one
+remaining lever — opaque branch cores with depth-written early-z (the flock's
+trick) to cull a dense canopy's overdraw — is deliberately *not* taken: it would
+trade away the smooth feathered edges that are the port's visual upgrade, and the
+worst case already meets target. That is the agreed stopping line.
+
 ## Boids are plain data, not entities
 
 A boid is 16 bytes of state (`vec4(pos, vel)`) in a flat array — not an ECS

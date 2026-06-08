@@ -21,7 +21,7 @@ mod menu;
 mod ui;
 
 use app::AppState;
-use experiments::{CurrentExperiment, ExperimentId, fish, flock, flow, lizard};
+use experiments::{CurrentExperiment, ExperimentId, fish, flock, flow, forest, lizard};
 
 fn main() {
     // Perf-test mode (`boids <count> [fish|flow] [pin] [headless] [nosim]`):
@@ -57,6 +57,8 @@ fn main() {
         ExperimentId::Flow
     } else if flag("lizard") {
         ExperimentId::Lizard
+    } else if flag("forest") {
+        ExperimentId::Forest
     } else {
         ExperimentId::Flock
     };
@@ -110,6 +112,7 @@ fn main() {
             fish::FishPlugin { headless },
             flow::FlowPlugin { headless },
             lizard::LizardPlugin { headless },
+            forest::ForestPlugin { headless },
         ));
 
     // Perf runs (any CLI arg) skip the menu and boot straight into the
